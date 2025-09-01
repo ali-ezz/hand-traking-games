@@ -1297,8 +1297,8 @@ async function startGame() {
     }
     // clear any previously loaded fruit images so preload can reload for new game
     ASSETS._fruitImages = [];
-    // attempt to preload assets for the selected game (do not block startup on failure)
-    await preloadAssets().catch(()=>{});
+    // start preloading assets but do not block camera startup
+    preloadAssets().catch(()=>{});
   } catch (e) {
     console.warn('per-game asset setup failed', e);
   }
