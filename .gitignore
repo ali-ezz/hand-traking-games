@@ -1,0 +1,42 @@
+# task_progress: 20%
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/
+.history
+
+# Python
+__pycache__/
+*.pyc
+
+# Build / output
+dist/
+build/
+coverage/
+*.local
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# IDEs
+.idea/
+
+# Thumbnails
+Thumbs.db
+
+# Misc
+.DS_Store
