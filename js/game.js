@@ -147,11 +147,11 @@ async function preloadAssets() {
   }
 
   // helper that attempts to load a single audio URL and resolves with the Audio element or null
-  function tryLoadAudioUrl(url, timeoutMs = 3000) {
+  // reduced default timeout to avoid long blocking waits on missing files
+  function tryLoadAudioUrl(url, timeoutMs = 1200) {
     return new Promise(res => {
       if (!url) return res(null);
       try {
-        // create audio element and set crossOrigin BEFORE assigning src
         const a = document.createElement('audio');
         a.preload = 'auto';
         try { a.crossOrigin = 'anonymous'; } catch (e) {}
@@ -176,9 +176,7 @@ async function preloadAssets() {
         };
         a.addEventListener('canplaythrough', onSuccess, { once: true });
         a.addEventListener('error', onFail, { once: true });
-        // assign src after listeners and crossOrigin set
         a.src = url;
-        // safety timeout
         setTimeout(() => { if (!settled) { settled = true; reportStatus('audio', `timeout ${url}`); res(null); } }, timeoutMs);
       } catch (e) {
         reportStatus('audio', `exception ${url}`);
@@ -194,14 +192,11 @@ async function preloadAssets() {
     // Build candidate paths (kept in the same preferred order)
     const sliceCandidates = [
       ASSETS.slice,
-      // common per-game locations
       `assets/${currentGameId}/slice.wav`,
       `assets/${currentGameId}/slice.mp3`,
       `assets/${currentGameId}/slice-frute.mp3`,
       `assets/${currentGameId}/slice-fruit.mp3`,
-      // known alternate folder used by the ninja assets
       `assets/ninga-game-sounds/slice-frute.mp3`,
-      // generic fallbacks
       `assets/slice.wav`,
       `assets/slice.mp3`
     ].filter(Boolean);
@@ -211,7 +206,6 @@ async function preloadAssets() {
       `assets/${currentGameId}/bomb.wav`,
       `assets/${currentGameId}/bomb.mp3`,
       `assets/${currentGameId}/bomb-frute.mp3`,
-      // check the shared ninja sounds folder (some filenames differ)
       `assets/ninga-game-sounds/boomb.mp3`,
       `assets/ninga-game-sounds/bomb.mp3`,
       `assets/bomb.wav`,
@@ -220,86 +214,76 @@ async function preloadAssets() {
 
     const bgmCandidates = (() => {
       const c = [ASSETS.bgm, `assets/${currentGameId}/bgm.mp3`].filter(Boolean);
-      // only consider the shared ninja bgm for the ninja-fruit mode to avoid loading it for other games
       if (currentGameId === 'ninja-fruit') c.push('assets/ninga-game-sounds/bgm.mp3');
       c.push('assets/bgm.mp3');
       return c.filter(Boolean);
     })();
 
-    // Try slice candidates sequentially and report results to UI
-    let found = false;
-    for (const url of sliceCandidates) {
-      reportStatus('slice', `trying ${url}`);
-      // small await so network isn't hammered; tryLoadAudioUrl handles timeouts
-      const a = await tryLoadAudioUrl(url);
-      if (a) {
-        soundPool.slice = a;
-        reportStatus('slice', `loaded ${a.src}`);
-        found = true;
-        break;
-      } else {
-        reportStatus('slice', `failed ${url}`);
+    // helper to race candidate loaders in parallel and pick the first successful
+    async function firstSuccessful(candidates, label) {
+      if (!candidates || !candidates.length) {
+        reportStatus(label, 'not found');
+        return null;
       }
-    }
-    if (!found) reportStatus('slice', 'not found');
-
-    // Try bomb candidates
-    found = false;
-    for (const url of bombCandidates) {
-      reportStatus('bomb', `trying ${url}`);
-      const a = await tryLoadAudioUrl(url);
-      if (a) {
-        soundPool.bomb = a;
-        reportStatus('bomb', `loaded ${a.src}`);
-        found = true;
-        break;
-      } else {
-        reportStatus('bomb', `failed ${url}`);
-      }
-    }
-    if (!found) reportStatus('bomb', 'not found');
-
-    // Try bgm candidates
-    found = false;
-    for (const url of bgmCandidates) {
-      reportStatus('bgm', `trying ${url}`);
-      const a = await tryLoadAudioUrl(url);
-      if (a) {
-        a.loop = true;
-        // stop any previously playing bgmAudio instance (different element) to avoid overlapping BGMs
-        try {
-          if (bgmAudio && bgmAudio !== a) {
-            try { bgmAudio.pause(); bgmAudio.currentTime = 0; } catch(e){}
+      const loaders = candidates.map(url => tryLoadAudioUrl(url, 1200).then(a => a ? { url, a } : Promise.reject(url)));
+      try {
+        // Promise.any returns first fulfilled; if none fulfilled it throws AggregateError
+        if (typeof Promise.any === 'function') {
+          const res = await Promise.any(loaders);
+          reportStatus(label, `loaded ${res.a.src}`);
+          return res.a;
+        } else {
+          // fall back to sequential scan if Promise.any isn't available
+          for (const url of candidates) {
+            reportStatus(label, `trying ${url}`);
+            const a = await tryLoadAudioUrl(url, 1200);
+            if (a) { reportStatus(label, `loaded ${a.src}`); return a; }
+            reportStatus(label, `failed ${url}`);
           }
+          reportStatus(label, 'not found');
+          return null;
+        }
+      } catch (e) {
+        reportStatus(label, 'not found');
+        return null;
+      }
+    }
+
+    // load slice/bomb/bgm in parallel but non-blocking for overall startup
+    // prefer fast selection; do not serially block on many 3s timeouts
+    firstSuccessful(sliceCandidates, 'slice').then(a => { if (a) soundPool.slice = a; else reportStatus('slice','not found'); });
+    firstSuccessful(bombCandidates, 'bomb').then(a => { if (a) soundPool.bomb = a; else reportStatus('bomb','not found'); });
+
+    // bgm needs special handling to stop previous bgmAudio if a new one is found
+    firstSuccessful(bgmCandidates, 'bgm').then(a => {
+      if (a) {
+        try {
+          a.loop = true;
+          if (bgmAudio && bgmAudio !== a) { try { bgmAudio.pause(); bgmAudio.currentTime = 0; } catch(e){} }
         } catch(e){}
         bgmAudio = a;
         reportStatus('bgm', `loaded ${a.src}`);
-        // auto-play if music is enabled for the current session
         if (musicEnabled) {
           try { bgmAudio.muted = false; bgmAudio.volume = 1.0; bgmAudio.play().catch(()=>{}); } catch(e){}
         }
-        found = true;
-        break;
       } else {
-        reportStatus('bgm', `failed ${url}`);
+        reportStatus('bgm','not found');
       }
-    }
-    if (!found) reportStatus('bgm', 'not found');
+    });
+
   } catch (e) {
     console.warn('audio setup issue', e);
     reportStatus('audio', 'setup exception');
   }
 
-  // Load any per-game short SFX entries provided via ASSETS.sfx
+  // Load any per-game short SFX entries provided via ASSETS.sfx (do these in parallel)
   if (ASSETS.sfx && typeof ASSETS.sfx === 'object') {
-    for (const [key, url] of Object.entries(ASSETS.sfx)) {
-      if (!url) {
-        reportStatus(`sfx:${key}`, 'no url');
-        continue;
-      }
+    const entries = Object.entries(ASSETS.sfx);
+    await Promise.all(entries.map(async ([key, url]) => {
+      if (!url) { reportStatus(`sfx:${key}`, 'no url'); return; }
       reportStatus(`sfx:${key}`, `trying ${url}`);
       try {
-        const a = await tryLoadAudioUrl(url);
+        const a = await tryLoadAudioUrl(url, 1200);
         if (a) {
           soundPool[key] = a;
           reportStatus(`sfx:${key}`, `loaded ${a.src}`);
@@ -309,7 +293,7 @@ async function preloadAssets() {
       } catch (e) {
         reportStatus(`sfx:${key}`, `exception ${url}`);
       }
-    }
+    }));
   }
 
   // load images listed explicitly in ASSETS.fruitSprites (no directory enumeration)
