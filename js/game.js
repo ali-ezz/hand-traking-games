@@ -57,8 +57,25 @@ let lastBombSpawn = 0;
 const objects = []; // fruits and bombs
 const particles = [];
 
+// Global caps and cooldowns to limit transient objects and audio thrash
+const MAX_PARTICLES = 200;
+const MAX_POPUPS = 24;
+const POPUP_COOLDOWN_MS = 50;
+const SOUND_COOLDOWN_MS = 80;
+// last play timestamps (stored on the shared debug object)
+if (!window.__handNinja) window.__handNinja = {};
+window.__handNinja._lastPopupTime = window.__handNinja._lastPopupTime || 0;
+window.__handNinja._lastSoundTimes = window.__handNinja._lastSoundTimes || {};
+
  // Paint Air mode scaffold
-const paintPaths = []; // stores {x,y,t}
+const paintPaths = []; // stores points and null separators: {x,y,t,color,size} or null
+// spatial buckets for fast erase lookups (keys -> arrays of point object refs)
+const paintBuckets = new Map();
+const BUCKET_SIZE = 80; // tuned bucket size; adjust if needed
+let lastPaintPushT = 0;
+let lastEraserProcessT = 0;
+let deletedCount = 0;
+
 let paintEnabled = false;
 let drawingEnabled = true;
 let paintColor = '#00b4ff';
@@ -67,12 +84,47 @@ let eraserMode = false;
 const paintTrack = []; // target path to trace (array of {x,y})
 let paintOnTrackLen = 0;
 let paintModeNoTimer = false;
+// auto-stop flag when two hands temporarily disable drawing
+let autoStoppedByTwoHands = false;
+
+// bucket helpers
+function bucketKey(x, y) { return `${Math.floor(x / BUCKET_SIZE)}:${Math.floor(y / BUCKET_SIZE)}`; }
+function addPointToBucket(pt) {
+  const k = bucketKey(pt.x, pt.y);
+  let arr = paintBuckets.get(k);
+  if (!arr) { arr = []; paintBuckets.set(k, arr); }
+  arr.push(pt);
+}
+function getBucketKeysForCircle(x, y, r) {
+  const minX = Math.floor((x - r) / BUCKET_SIZE);
+  const maxX = Math.floor((x + r) / BUCKET_SIZE);
+  const minY = Math.floor((y - r) / BUCKET_SIZE);
+  const maxY = Math.floor((y + r) / BUCKET_SIZE);
+  const keys = [];
+  for (let gx = minX; gx <= maxX; gx++) {
+    for (let gy = minY; gy <= maxY; gy++) {
+      keys.push(`${gx}:${gy}`);
+    }
+  }
+  return keys;
+}
+function compactPaintStorage() {
+  // remove deleted points and rebuild buckets to avoid unbounded growth
+  const kept = paintPaths.filter(p => p === null || (p && !p._deleted));
+  paintPaths.length = 0;
+  paintPaths.push(...kept);
+  paintBuckets.clear();
+  for (const p of paintPaths) {
+    if (p && p !== null && !p._deleted) addPointToBucket(p);
+  }
+  deletedCount = 0;
+}
 
  // Shape Trace scaffold
 let shapes = [];
 let shapeIndex = 0;
 let shapeCovered = [];
-let shapeTolerance = 30;
+let shapeTolerance = 80; // increased tolerance so corners register more easily
 let shapeProgress = 0;
 
 // Simple gesture detector using mapped hand landmarks (canvas coords).
@@ -97,7 +149,505 @@ function detectSimpleGesture(hand) {
   } catch (e) { return null; }
 }
 
-// Assets & sounds configuration (set URLs or leave null)
+// Inline modules: Runner-Control and Simon-Pro (consolidated into main file)
+// These reuse existing globals: ctx, canvas, DPR, spawnParticles, spawnPopup, playSound, detectSimpleGesture
+
+const runnerControlModule = (function(){
+  // Runner-Control: compact inline port
+  let avatar = null;
+  let obstacles = [];
+  let lastSpawn = 0;
+  let runningModule = false;
+  const OB_SPAWN_MS = 1300;
+  const MAX_OBSTACLES = 4;
+  const GRAVITY_MODULE = 1200;
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function randInt(a,b){ return Math.floor(rand(a,b+1)); }
+
+  function resetRunner(){
+    const width = canvas.width / DPR;
+    const height = canvas.height / DPR;
+    // No lives: runner-play is time-limited only. Score stored globally.
+    avatar = { x: Math.max(80, width*0.18), y: height*0.5, vy:0, r:16, speed: 180, stamina: 1.0 };
+    obstacles = [];
+    lastSpawn = performance.now();
+    runningModule = true;
+  }
+
+  function spawnObstacleRunner(){
+    // limit concurrent obstacles to make the game easier
+    if (obstacles.length >= MAX_OBSTACLES) return;
+    const width = canvas.width / DPR;
+    const height = canvas.height / DPR;
+    const h = randInt(28, 64);
+    const gap = randInt(150, 240);
+    const y = randInt(60, Math.max(100, height - 60 - gap));
+
+    // narrower speed variance so "slow" pliers are closer to fast ones
+    const baseSpeed = 230;
+    const speed = baseSpeed + randInt(-12, 12);
+
+    // stagger spawn X to avoid overlapping pairs and give player room
+    const STAGGER = 96; // px between nominal spawn offsets
+    const JITTER = randInt(0, 40);
+    const baseX = width + 80;
+    const spawnX = baseX + obstacles.length * STAGGER + JITTER;
+
+    // prevent spawning too close to existing obstacles; skip this spawn if too close
+    const MIN_HORIZONTAL_GAP = 140;
+    for (const o of obstacles) {
+      if (Math.abs(o.x - spawnX) < MIN_HORIZONTAL_GAP) {
+        // defer spawn (will be retried on next spawn window)
+        return;
+      }
+    }
+
+    obstacles.push({ id: Math.random().toString(36).slice(2,9), x: spawnX, y, h, gap, w: 32, speed, passed:false });
+  }
+
+  function updateRunner(dt, hands){
+    if (!runningModule) return;
+    // stop updating when global run state ended
+    if (!running) { runningModule = false; return; }
+    const width = canvas.width / DPR;
+    const height = canvas.height / DPR;
+
+    // integrate motion with smoother damping to avoid jitter/etching.
+    // Use fingertip-driven desired velocity and lerp avatar.vy toward it, then integrate.
+    // This produces responsive but smoothed movement and reduces abrupt positional jumps.
+    const tip = (hands && hands.length === 1 && hands[0] && hands[0][8]) ? hands[0][8] : null;
+    if (tip) {
+      const targetY = tip.y;
+      // compute desired velocity to move toward fingertip (tunable responsiveness)
+      const desiredVy = (targetY - avatar.y) * 8; // higher = more responsive
+      // lerp factor for velocity smoothing (frame-rate independent)
+      const blend = Math.min(1, 8 * dt);
+      avatar.vy += (desiredVy - avatar.vy) * blend;
+      // small gravity to preserve subtle downward feel when fingertip still
+      avatar.vy += GRAVITY_MODULE * dt * 0.001;
+      // integrate position
+      avatar.y += avatar.vy * dt;
+
+      // compute fingertip velocity for poke detection (unchanged measurement)
+      if (!updateRunner._lastTipY) updateRunner._lastTipY = targetY;
+      const vyTip = (targetY - updateRunner._lastTipY) / Math.max(0.001, dt);
+      updateRunner._lastTipY = targetY;
+
+      // quick downward poke (hand moving quickly downward) => give a smooth upward impulse
+      // Remove particle and jump sound to satisfy "no jump particles or sound" requirement.
+      if (vyTip > 300) {
+        // apply an upward velocity impulse (clamped) for a responsive pop without visual/sound noise
+        const impulse = Math.min(220, vyTip * 0.02);
+        // set a negative vy to move avatar upward smoothly
+        avatar.vy = Math.min(avatar.vy, -impulse);
+      }
+    }
+
+    // clamp
+    if (avatar.y < 20) { avatar.y = 20; avatar.vy = 0; }
+    if (avatar.y > height - 20) { avatar.y = height - 20; avatar.vy = 0; }
+
+    // spawn obstacles
+    const now = performance.now();
+    if (now - lastSpawn > OB_SPAWN_MS) {
+      lastSpawn = now;
+      spawnObstacleRunner();
+      if (Math.random() < 0.06) lastSpawn -= 260;
+    }
+
+    // update obstacles
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.x -= o.speed * dt;
+
+      // collision check
+      if (avatar.x + avatar.r > o.x && avatar.x - avatar.r < o.x + o.w) {
+        if (avatar.y - avatar.r < o.y + o.h || avatar.y + avatar.r > o.y + o.gap) {
+          // collision: do not remove lives. Apply a small global score penalty and visual feedback.
+          score = Math.max(0, score - 5);
+          spawnParticles && spawnParticles(avatar.x, avatar.y, 'rgba(255,80,80,0.95)', 16);
+          spawnPopup && spawnPopup(avatar.x, avatar.y, '-5', { col: 'rgba(255,80,80,0.9)', size: 18 });
+          try { playSound && playSound('bomb'); } catch(e){}
+          avatar.x -= 8;
+          obstacles.splice(i,1);
+          updateUI();
+          continue;
+        }
+      }
+
+      // scoring when obstacle passes avatar
+      if (!o.passed && o.x + o.w < avatar.x) {
+        o.passed = true;
+        score += 10;
+        spawnPopup && spawnPopup(avatar.x + 40, avatar.y, '+10', { col: 'yellow', size: 14 });
+        try { playSound && playSound('point'); } catch(e){}
+        updateUI();
+      }
+
+      if (o.x + o.w < -120) obstacles.splice(i,1);
+    }
+
+    // no lives-based end condition: runner-control runs until the global timer ends
+    // (keep module alive; global endGame() will be called when time runs out)
+  }
+
+  function drawRunner(){
+    if (!ctx) return;
+    const width = canvas.width / DPR;
+    const height = canvas.height / DPR;
+    ctx.save();
+    // keep video visible as background so the user can see themself (do not paint over)
+    // avatar
+    ctx.beginPath();
+    ctx.fillStyle = 'orange';
+    ctx.arc(avatar.x, avatar.y, avatar.r, 0, Math.PI*2);
+    ctx.fill();
+    // HUD is handled by the global UI (scoreEl) — no per-avatar score box here.
+    // obstacles
+    for (const o of obstacles) {
+      ctx.fillStyle = '#444';
+      ctx.fillRect(o.x, 0, o.w, o.y + o.h);
+      ctx.fillRect(o.x, o.y + o.gap, o.w, height - (o.y + o.gap));
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.strokeRect(o.x, o.y, o.w, o.h);
+    }
+    ctx.restore();
+  }
+
+  return {
+    init(){ resetRunner(); },
+    update(dt, hands){ updateRunner(dt, hands); drawRunner(); },
+    onStart(){ resetRunner(); },
+    onEnd(){
+      runningModule = false;
+      try { updateUI(); } catch(e){}
+    }
+  };
+})();
+
+const mazeModule = (function(){
+  // Maze Game (previously Simon-Pro): start in center and reach one of the exit cells at the maze edge.
+  // Supports a "mini" variant (smaller grids + multiple exits) for easier play.
+  let cols = 0, rows = 0, cellSize = 0;
+  let mazeOx = 0, mazeOy = 0;
+  let finished = false;
+  let cells = null; // array of { walls: [top,right,bottom,left], visited }
+  let player = null; // { cx, cy, x, y, targetX, targetY }
+  let exitCells = []; // array of possible exit cells {cx,cy}
+  let runningModule = false;
+
+  function randInt(a,b){ return Math.floor(a + Math.random()*(b-a+1)); }
+  function idx(cx,cy){ return cx + cy * cols; }
+
+  function generateMaze(w, h) {
+    // Mini maze: use a smaller grid and shrink cells so the maze doesn't fill the whole frame
+    cols = Math.max(3, Math.floor(w / 120));
+    rows = Math.max(3, Math.floor(h / 120));
+    // compute base cell size then reduce so maze appears smaller and easier
+    const baseCell = Math.floor(Math.min(w / cols, h / rows));
+    cellSize = Math.max(18, Math.floor(baseCell * 0.66));
+    // compute maze origin so drawing and input coordinate spaces align
+    const mazeW = cols * cellSize, mazeH = rows * cellSize;
+    mazeOx = Math.floor((w - mazeW) / 2);
+    mazeOy = Math.floor((h - mazeH) / 2);
+    cells = new Array(cols * rows);
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        cells[idx(x,y)] = { walls: [true, true, true, true], visited: false };
+      }
+    }
+    // randomized DFS
+    const stack = [];
+    const startX = Math.floor(cols/2), startY = Math.floor(rows/2);
+    cells[idx(startX,startY)].visited = true;
+    stack.push({x:startX,y:startY});
+    while (stack.length) {
+      const cur = stack[stack.length-1];
+      const neighbors = [];
+      const dirs = [
+        { dx:0, dy:-1, wallA:0, wallB:2 }, // top
+        { dx:1, dy:0, wallA:1, wallB:3 },  // right
+        { dx:0, dy:1, wallA:2, wallB:0 },  // bottom
+        { dx:-1, dy:0, wallA:3, wallB:1 }  // left
+      ];
+      for (const d of dirs) {
+        const nx = cur.x + d.dx, ny = cur.y + d.dy;
+        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && !cells[idx(nx,ny)].visited) neighbors.push({nx,ny,d});
+      }
+      if (neighbors.length === 0) {
+        stack.pop();
+      } else {
+        const pick = neighbors[randInt(0, neighbors.length - 1)];
+        // knock down wall between cur and pick
+        const a = cells[idx(cur.x,cur.y)], b = cells[idx(pick.nx,pick.ny)];
+        a.walls[pick.d.wallA] = false;
+        b.walls[pick.d.wallB] = false;
+        b.visited = true;
+        stack.push({x: pick.nx, y: pick.ny});
+      }
+    }
+    // pick exit(s) on border cells (not the center). For mini mode choose multiple exits.
+    const borderCandidates = [];
+    for (let x = 0; x < cols; x++) { borderCandidates.push({x, y:0}); borderCandidates.push({x, y:rows-1}); }
+    for (let y = 1; y < rows-1; y++) { borderCandidates.push({x:0, y}); borderCandidates.push({x:cols-1, y}); }
+    // choose cell(s) that are not the start
+    const startIdx = idx(startX, startY);
+    exitCells = [];
+    if (currentGameId === 'maze-mini') {
+      // easier: pick several distinct border exits (2-4)
+      const count = randInt(2, Math.min(4, Math.max(2, Math.floor((cols + rows) / 6))));
+      const used = new Set();
+      while (exitCells.length < count) {
+        const c = borderCandidates[randInt(0, borderCandidates.length - 1)];
+        const k = idx(c.x, c.y);
+        if (k === startIdx || used.has(k)) continue;
+        used.add(k);
+        exitCells.push({ cx: c.x, cy: c.y });
+        if (exitCells.length >= borderCandidates.length) break;
+      }
+      if (exitCells.length === 0) {
+        const c = borderCandidates[0];
+        exitCells.push({ cx: c.x, cy: c.y });
+      }
+    } else {
+      // single exit chosen randomly
+      let chosen = null;
+      for (let i = 0; i < 12; i++) {
+        const c = borderCandidates[randInt(0, borderCandidates.length - 1)];
+        if (idx(c.x, c.y) !== startIdx) { chosen = c; break; }
+      }
+      if (!chosen) chosen = borderCandidates[0];
+      exitCells = [{ cx: chosen.x, cy: chosen.y }];
+    }
+
+    // player starts in center cell
+    player = {
+      cx: startX, cy: startY,
+      x: startX * cellSize + cellSize/2,
+      y: startY * cellSize + cellSize/2,
+      targetX: startX * cellSize + cellSize/2,
+      targetY: startY * cellSize + cellSize/2,
+      speed: Math.max(160, cellSize * 3) // pixels per second-ish
+    };
+  }
+
+  function cellCenter(cx,cy) { return { x: cx * cellSize + cellSize/2, y: cy * cellSize + cellSize/2 }; }
+
+  function tryMoveTowardTip(tip) {
+    if (!tip || !player) return;
+    // map fingertip into maze-local coordinates
+    const localTipX = tip.x - (mazeOx || 0);
+    const localTipY = tip.y - (mazeOy || 0);
+    const vx = localTipX - player.x;
+    const vy = localTipY - player.y;
+    const dist = Math.hypot(vx, vy);
+    if (dist < 4) return;
+
+    // compute a modest fractional step toward the fingertip (actual smoothing happens in updateModule)
+    const maxStep = Math.max(12, player.speed * 0.02); // small step to allow responsive guidance
+    const stepFactor = Math.min(1, maxStep / dist);
+    const desiredX = player.x + vx * stepFactor;
+    const desiredY = player.y + vy * stepFactor;
+
+    const curCx = player.cx, curCy = player.cy;
+    const tCx = Math.floor(desiredX / cellSize);
+    const tCy = Math.floor(desiredY / cellSize);
+
+    // quick allow if staying inside current cell
+    if (tCx === curCx && tCy === curCy) {
+      player.targetX = desiredX;
+      player.targetY = desiredY;
+      return;
+    }
+
+    // helper to check if wall between two neighboring cells is open
+    function isOpenBetween(cx, cy, nx, ny) {
+      if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) return false;
+      const cur = cells[idx(cx, cy)];
+      const dx = nx - cx, dy = ny - cy;
+      if (dx === 1) return !cur.walls[1];
+      if (dx === -1) return !cur.walls[3];
+      if (dy === 1) return !cur.walls[2];
+      if (dy === -1) return !cur.walls[0];
+      return false;
+    }
+
+    // allow movement to adjacent cell only if opening exists between current and target
+    if (Math.abs(tCx - curCx) + Math.abs(tCy - curCy) === 1) {
+      if (isOpenBetween(curCx, curCy, tCx, tCy)) {
+        player.cx = tCx; player.cy = tCy;
+        player.targetX = desiredX;
+        player.targetY = desiredY;
+        return;
+      }
+    }
+
+    // handle diagonal desires by preferring the larger axis if possible
+    if (Math.abs(tCx - curCx) + Math.abs(tCy - curCy) === 2) {
+      // try horizontal first if vx dominates
+      if (Math.abs(vx) > Math.abs(vy)) {
+        const nx = curCx + (vx > 0 ? 1 : -1), ny = curCy;
+        if (isOpenBetween(curCx, curCy, nx, ny)) {
+          player.cx = nx; player.cy = ny;
+          player.targetX = desiredX;
+          player.targetY = desiredY;
+          return;
+        }
+      } else {
+        const nx = curCx, ny = curCy + (vy > 0 ? 1 : -1);
+        if (isOpenBetween(curCx, curCy, nx, ny)) {
+          player.cx = nx; player.cy = ny;
+          player.targetX = desiredX;
+          player.targetY = desiredY;
+          return;
+        }
+      }
+    }
+
+    // otherwise clamp the target to remain within current cell bounds to prevent crossing walls
+    const minX = curCx * cellSize + 4;
+    const maxX = (curCx + 1) * cellSize - 4;
+    const minY = curCy * cellSize + 4;
+    const maxY = (curCy + 1) * cellSize - 4;
+    player.targetX = Math.min(Math.max(desiredX, minX), maxX);
+    player.targetY = Math.min(Math.max(desiredY, minY), maxY);
+  }
+
+  function updateModule(dt, hands){
+    if (!runningModule) return;
+    const now = performance.now();
+    // draw maze and HUD each frame
+    drawMaze();
+
+    // fingertip drives movement: use input only when exactly one hand is present (ignore multi-hand interference)
+    const tip = (hands && hands.length === 1 && hands[0] && hands[0][8]) ? hands[0][8] : null;
+    if (tip) tryMoveTowardTip(tip);
+
+    // smoothly move player toward target center
+    const distX = player.targetX - player.x;
+    const distY = player.targetY - player.y;
+    const dist = Math.hypot(distX, distY);
+    if (dist > 0.5) {
+      const maxStep = player.speed * dt;
+      const t = Math.min(1, maxStep / dist);
+      player.x += distX * t;
+      player.y += distY * t;
+    }
+
+    // check exit reached (cell equality against any exit)
+    if (exitCells && exitCells.some(e => e.cx === player.cx && e.cy === player.cy)) {
+      // reached exit: reward and advance to the next maze level instead of ending the game
+      spawnPopup && spawnPopup((canvas.width / DPR)/2, 80, 'Level Complete!', { col: 'lime', size: 24 });
+      try { playSound && playSound('segment_complete'); } catch(e){}
+      score += 100;
+      updateUI();
+      // briefly pause module while preparing next level
+      runningModule = false;
+      finished = false;
+      setTimeout(()=> {
+        try {
+          // regenerate a new maze for the current canvas size
+          generateMaze((canvas.width / DPR), (canvas.height / DPR));
+          // reset player to center of new maze
+          const startCX = Math.floor(cols/2), startCY = Math.floor(rows/2);
+          if (player) {
+            player.cx = startCX; player.cy = startCY;
+            const c = cellCenter(startCX, startCY);
+            player.x = player.targetX = c.x;
+            player.y = player.targetY = c.y;
+          }
+          // resume module
+          runningModule = true;
+        } catch(e) { console.warn('advance maze failed', e); }
+      }, 650);
+    }
+  }
+
+  function drawMaze(){
+    if (!ctx || !cells) return;
+    const width = canvas.width / DPR, height = canvas.height / DPR;
+    ctx.save();
+    // semi-opaque panel behind maze for clarity (use computed maze origin so panel and maze align)
+    const mazeW = cols * cellSize, mazeH = rows * cellSize;
+    const ox = mazeOx || Math.floor((width - mazeW) / 2);
+    const oy = mazeOy || Math.floor((height - mazeH) / 2);
+    const pad = 12;
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.fillRect(ox - Math.floor(pad/2), oy - Math.floor(pad/2), Math.min(width - pad, mazeW + pad), Math.min(height - pad, mazeH + pad));
+ 
+    // translate to maze origin (center it roughly) - ox/oy already set above
+
+    // draw grid walls
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 2;
+    for (let cy = 0; cy < rows; cy++) {
+      for (let cx = 0; cx < cols; cx++) {
+        const cell = cells[idx(cx,cy)];
+        const x0 = ox + cx * cellSize, y0 = oy + cy * cellSize;
+        // top
+        if (cell.walls[0]) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + cellSize, y0); ctx.stroke(); }
+        // right
+        if (cell.walls[1]) { ctx.beginPath(); ctx.moveTo(x0 + cellSize, y0); ctx.lineTo(x0 + cellSize, y0 + cellSize); ctx.stroke(); }
+        // bottom
+        if (cell.walls[2]) { ctx.beginPath(); ctx.moveTo(x0, y0 + cellSize); ctx.lineTo(x0 + cellSize, y0 + cellSize); ctx.stroke(); }
+        // left
+        if (cell.walls[3]) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + cellSize); ctx.stroke(); }
+      }
+    }
+
+    // highlight exit cells
+    if (exitCells && exitCells.length) {
+      ctx.fillStyle = 'rgba(255,200,60,0.95)';
+      for (const exCell of exitCells) {
+        const ex = ox + exCell.cx * cellSize, ey = oy + exCell.cy * cellSize;
+        ctx.fillRect(ex + 4, ey + 4, cellSize - 8, cellSize - 8);
+      }
+    }
+
+    // draw player
+    if (player) {
+      const px = ox + (player.x), py = oy + (player.y);
+      ctx.beginPath();
+      ctx.fillStyle = 'cyan';
+      ctx.arc(ox + player.x, oy + player.y, Math.max(8, cellSize * 0.18), 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // small target ring
+      ctx.beginPath();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(0,200,255,0.9)';
+      ctx.arc(ox + player.targetX, oy + player.targetY, Math.max(6, cellSize * 0.12), 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    // HUD label
+    ctx.fillStyle = 'white';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Maze — move your index finger to navigate to the highlighted exit', width/2, oy - 8);
+    ctx.restore();
+  }
+
+  function initModule(){
+    // reset finished flag when starting a new maze run
+    finished = false;
+    const width = canvas.width / DPR, height = canvas.height / DPR;
+    generateMaze(width, height);
+    runningModule = true;
+  }
+
+  return {
+    init(){ initModule(); },
+    update(dt, hands){ updateModule(dt, hands); },
+    onStart(){ initModule(); },
+    onEnd(){ runningModule = false; }
+  };
+})();
+
+ // Assets & sounds configuration (set URLs or leave null)
 // Populate ASSETS.fruitSprites with image URLs to give fruits a graphical look.
 // Example:
 //   ASSETS.bgm = 'assets/bgm.mp3'
@@ -264,7 +814,8 @@ async function preloadAssets() {
         bgmAudio = a;
         reportStatus('bgm', `loaded ${a.src}`);
         if (musicEnabled) {
-          try { bgmAudio.muted = false; bgmAudio.volume = 1.0; bgmAudio.play().catch(()=>{}); } catch(e){}
+          try { bgmAudio.muted = false; bgmAudio.volume = 1.0; } catch(e){}
+          bgmAudio.play().catch(()=>{});
         }
       } else {
         reportStatus('bgm','not found');
@@ -330,14 +881,30 @@ function playSound(name) {
       }
       return;
     }
+
+    // sound cooldowns to avoid thrashing when many segments/points trigger at once
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const lastTimes = window.__handNinja._lastSoundTimes || (window.__handNinja._lastSoundTimes = {});
+    const cooldownMap = {
+      point: 80,
+      segment_complete: 80,
+      popup: 80,
+      shape_complete: 300,
+      // fallback default
+      default: SOUND_COOLDOWN_MS || 80
+    };
+    const cd = cooldownMap[name] || cooldownMap.default;
+    if (lastTimes[name] && now - lastTimes[name] < cd) return;
+    lastTimes[name] = now;
+
     const a = soundPool[name];
     if (!a) return;
     // clone to allow overlapping playback in some browsers
     const inst = a.cloneNode ? a.cloneNode() : new Audio(a.src);
     try { inst.muted = false; inst.volume = 1.0; } catch(e){}
     inst.play().catch((err) => {
-      // report in asset status if playback is blocked
-      try { reportStatus('audio', `play blocked ${name}`); } catch(e){}
+      // report in asset status if playback is blocked (preload helper defines reportStatus; guard)
+      try { if (typeof reportStatus === 'function') reportStatus('audio', `play blocked ${name}`); } catch(e){}
     });
   } catch(e){}
 }
@@ -377,25 +944,36 @@ function mapLandmarksToCanvas(landmarks, results) {
   }));
 }
 
-// Generate random shape outlines (returns { points: [{x,y}], type })
+ // Generate random shape outlines (returns { points: [{x,y}], type })
 function generateRandomShape() {
   const w = canvas.width / DPR;
   const h = canvas.height / DPR;
-  const types = ['circle','rect','poly'];
+  // expanded set of shape types; keep sampling density low for performance
+  const types = ['circle', 'rect', 'triangle', 'ellipse', 'star', 'rounded-rect', 'heart', 'poly'];
   const type = types[randInt(0, types.length - 1)];
   const points = [];
+  const margin = 40; // keep shapes away from edge
 
   if (type === 'circle') {
     const cx = rand(w * 0.25, w * 0.75);
     const cy = rand(h * 0.25, h * 0.75);
-    const r = rand(Math.min(w,h) * 0.12, Math.min(w,h) * 0.26);
-    const segments = 64;
+    const r = rand(Math.min(w, h) * 0.12, Math.min(w, h) * 0.26);
+    const segments = 18;
     for (let i = 0; i <= segments; i++) {
       const a = (i / segments) * Math.PI * 2;
       points.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
     }
-  } else if (type === 'rect') {
-    const margin = 40;
+  } else if (type === 'ellipse') {
+    const cx = rand(w * 0.25, w * 0.75);
+    const cy = rand(h * 0.25, h * 0.75);
+    const rx = rand(Math.min(w, h) * 0.12, Math.min(w, h) * 0.28);
+    const ry = rx * rand(0.6, 1.0);
+    const segments = 20;
+    for (let i = 0; i <= segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      points.push({ x: cx + Math.cos(a) * rx, y: cy + Math.sin(a) * ry });
+    }
+  } else if (type === 'rect' || type === 'rounded-rect') {
     const rw = rand(w * 0.25, w * 0.6);
     const rh = rand(h * 0.18, h * 0.45);
     const x0 = rand(margin, w - margin - rw);
@@ -407,26 +985,124 @@ function generateRandomShape() {
       { x: x0, y: y0 + rh },
       { x: x0, y: y0 } // close
     ];
-    // interpolate edges
-    const segPerEdge = 20;
-    for (let e = 0; e < corners.length - 1; e++) {
-      const a = corners[e], b = corners[e+1];
+ // for rounded-rect, create small arc-like joins; otherwise straight interpolation
+ // increase samples per edge to better preserve sharp corners (reduce missing top-right corners)
+ const segPerEdge = 6;
+ for (let e = 0; e < corners.length - 1; e++) {
+      const a = corners[e], b = corners[e + 1];
       for (let i = 0; i <= segPerEdge; i++) {
         const t = i / segPerEdge;
-        points.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+        let x = a.x + (b.x - a.x) * t;
+        let y = a.y + (b.y - a.y) * t;
+        // nudge points slightly for rounded appearance if requested
+        if (type === 'rounded-rect' && (i === 0 || i === segPerEdge)) {
+          // move corner points inward a bit to simulate a rounded corner
+          const nx = a.x + (b.x - a.x) * (i === 0 ? 0.12 : 0.88);
+          const ny = a.y + (b.y - a.y) * (i === 0 ? 0.12 : 0.88);
+          x = nx; y = ny;
+        }
+        points.push({ x, y });
       }
     }
-  } else {
-    // polygon (random n-gon)
+  } else if (type === 'triangle') {
     const cx = rand(w * 0.3, w * 0.7);
     const cy = rand(h * 0.3, h * 0.7);
-    const r = rand(Math.min(w,h) * 0.12, Math.min(w,h) * 0.28);
-    const sides = randInt(5, 8);
-    for (let i = 0; i <= sides * 10; i++) {
-      const a = (i / (sides * 10)) * Math.PI * 2;
-      // slight radial perturbation to make shape interesting
-      const rr = r * (1 + Math.sin(a * 3 + rand(-0.2,0.2)) * 0.12);
+    const r = rand(Math.min(w, h) * 0.14, Math.min(w, h) * 0.32);
+    const segments = 3;
+    for (let i = 0; i <= segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      points.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+    }
+    // interpolate edges a bit to increase segment count modestly
+    const interp = [];
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i], b = points[i + 1];
+      interp.push(a);
+      interp.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    }
+    interp.push(points[points.length - 1]);
+    points.length = 0;
+    points.push(...interp);
+  } else if (type === 'star') {
+    const cx = rand(w * 0.3, w * 0.7);
+    const cy = rand(h * 0.3, h * 0.7);
+    const R = rand(Math.min(w, h) * 0.12, Math.min(w, h) * 0.26);
+    const r = R * rand(0.44, 0.6);
+    const spikes = randInt(5, 7);
+    const segs = spikes * 2;
+    for (let i = 0; i <= segs; i++) {
+      const a = (i / segs) * Math.PI * 2;
+      const rr = (i % 2 === 0) ? R : r;
       points.push({ x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr });
+    }
+  } else if (type === 'heart') {
+    // parametric heart shape scaled and translated to fit canvas
+    const cx = rand(w * 0.35, w * 0.65);
+    const cy = rand(h * 0.35, h * 0.65);
+    const scale = rand(Math.min(w, h) * 0.08, Math.min(w, h) * 0.18);
+    const segs = 28;
+    for (let i = 0; i <= segs; i++) {
+      const t = (i / segs) * Math.PI * 2;
+      const x = 16 * Math.sin(t) ** 3;
+      const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+      points.push({ x: cx + x * scale * 0.6, y: cy - y * scale * 0.6 });
+    }
+  } else {
+    // fallback polygon (random n-gon) with modest sampling
+    const cx = rand(w * 0.3, w * 0.7);
+    const cy = rand(h * 0.3, h * 0.7);
+    const r = rand(Math.min(w, h) * 0.12, Math.min(w, h) * 0.28);
+    const sides = randInt(4, 8);
+    const steps = Math.max(6, sides * 2);
+    for (let i = 0; i <= steps; i++) {
+      const a = (i / steps) * Math.PI * 2;
+      const rr = r * (1 + Math.sin(a * 3 + rand(-0.2, 0.2)) * 0.12);
+      points.push({ x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr });
+    }
+  }
+
+  // safety: clamp/fit shape to canvas bounds to avoid off-screen or oversized shapes
+  if (points.length) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of points) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const bboxW = Math.max(1, maxX - minX);
+    const bboxH = Math.max(1, maxY - minY);
+    // scale down if shape too large for canvas area
+    const availW = Math.max(32, w - margin * 2);
+    const availH = Math.max(32, h - margin * 2);
+    const scale = Math.min(1, availW / bboxW, availH / bboxH);
+    if (scale < 0.999) {
+      // scale about center
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      for (const p of points) {
+        p.x = cx + (p.x - cx) * scale;
+        p.y = cy + (p.y - cy) * scale;
+      }
+      minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+      for (const p of points) {
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    // translate if any point falls outside margin area
+    let dx = 0, dy = 0;
+    if (minX < margin) dx = margin - minX;
+    if (maxX > w - margin) dx = (w - margin) - maxX;
+    if (minY < margin) dy = margin - minY;
+    if (maxY > h - margin) dy = (h - margin) - maxY;
+    if (dx !== 0 || dy !== 0) {
+      for (const p of points) {
+        p.x += dx;
+        p.y += dy;
+      }
     }
   }
 
@@ -651,16 +1327,43 @@ function darken(hslStr, amt) {
 }
 
 /* particles (simple splash) and floating score popups */
-function spawnParticles(x,y,color,count=8) {
+function spawnParticles(x,y,color,count=8, opts) {
+  // particle freeze window: suppress new bursts for a short window after heavy trace events
+  const _nowParticle = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  if (window.__handNinja && window.__handNinja._lastParticleFreeze && _nowParticle - window.__handNinja._lastParticleFreeze < 220) return;
+  // suppress heavy particles entirely during shape-trace to avoid hitches
+  if (currentGameId === 'shape-trace') return;
+
+  // allow callers to request a reduced burst (e.g. { source: 'shape-trace' })
+  const isShapeTrace = !!(opts && opts.source === 'shape-trace');
+  if (isShapeTrace) {
+    // be very conservative during shape-trace to avoid frame hiccups
+    count = Math.min(count, 1);
+  }
+
+  // soft global cap for responsiveness; if too many particles exist, skip new bursts
+  const SOFT_PARTICLE_CAP = 120;
+  if (particles.length >= SOFT_PARTICLE_CAP) return;
+
+  // enforce global cap to avoid unbounded growth and heavy per-frame cost
+  if (particles.length >= MAX_PARTICLES) {
+    // try to trim oldest particles to make room, otherwise skip spawning
+    const toTrim = Math.min( Math.max(0, particles.length - (MAX_PARTICLES - count)), particles.length );
+    if (toTrim > 0) particles.splice(0, toTrim);
+    if (particles.length >= MAX_PARTICLES) return;
+  }
+
   for (let i=0;i<count;i++){
-    particles.push({
+    // smaller, shorter-lived, and lower-velocity particles for shape-trace (if any)
+    const p = {
       x, y,
-      vx: rand(-320,320),
-      vy: rand(-320, -80),
-      life: rand(0.35, 0.9),
+      vx: isShapeTrace ? rand(-80,80) : rand(-320,320),
+      vy: isShapeTrace ? rand(-160, -40) : rand(-320, -80),
+      life: isShapeTrace ? rand(0.12, 0.28) : rand(0.35, 0.9),
       col: color,
-      r: rand(2,5)
-    });
+      r: isShapeTrace ? rand(1,3) : rand(2,5)
+    };
+    particles.push(p);
   }
 }
 function drawParticles(dt) {
@@ -683,6 +1386,17 @@ function drawParticles(dt) {
 /* floating score popups */
 const popups = [];
 function spawnPopup(x,y,text,opts={}) {
+  const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  // enforce a short global cooldown to avoid thousands of popups in a single frame
+  if (now - (window.__handNinja._lastPopupTime || 0) < POPUP_COOLDOWN_MS) return;
+  window.__handNinja._lastPopupTime = now;
+
+  // cap total concurrent popups
+  if (popups.length >= MAX_POPUPS) {
+    // optionally discard oldest to make room for higher-priority popup (here we discard oldest)
+    popups.shift();
+  }
+
   popups.push({
     x, y,
     text: String(text),
@@ -828,22 +1542,32 @@ function showLeaders() {
   const top = Object.values(bestByKey).sort((a,b) => b.score - a.score).slice(0,10);
 
   const topEl = document.getElementById('leadersTop');
-  const recentEl = document.getElementById('leadersRecent');
   if (topEl) topEl.innerHTML = '';
-  if (recentEl) recentEl.innerHTML = '';
 
-  if (top.length === 0) {
-    const li = document.createElement('li');
-    li.textContent = 'no ledars yet';
-    if (topEl) topEl.appendChild(li);
+  if (!top || top.length === 0) {
+    if (topEl) {
+      const li = document.createElement('li');
+      li.className = 'leader-row';
+      const r = document.createElement('span'); r.className = 'rank'; r.textContent = '-';
+      const n = document.createElement('span'); n.className = 'name'; n.textContent = 'No leaders yet';
+      const s = document.createElement('span'); s.className = 'leader-score'; s.textContent = '-';
+      li.appendChild(r); li.appendChild(n); li.appendChild(s);
+      topEl.appendChild(li);
+    }
     console.info(`showLeaders -> key=${storageKey(selForList)} empty`);
     return;
   }
 
-  for (const entry of top) {
+  for (let i = 0; i < top.length; i++) {
+    const entry = top[i];
+    if (!entry) continue;
     const li = document.createElement('li');
-    li.textContent = `${entry.name} — ${entry.score}`;
-    if (topEl) topEl.appendChild(li);
+    li.className = 'leader-row';
+    const r = document.createElement('span'); r.className = 'rank'; r.textContent = `${i+1}.`;
+    const n = document.createElement('span'); n.className = 'name'; n.textContent = entry.name || 'Player';
+    const s = document.createElement('span'); s.className = 'leader-score'; s.textContent = String(entry.score || 0);
+    li.appendChild(r); li.appendChild(n); li.appendChild(s);
+    topEl.appendChild(li);
   }
   console.info(`showLeaders -> key=${storageKey(selForList)}, count=${top.length}`);
 }
@@ -1004,101 +1728,177 @@ function onResults(results) {
   }
 
   // collision detection and mode-specific interactions
-  if (currentGameId === 'paint-air') {
-    // Draw and record index-finger path for Paint Air mode and award points only when on-track.
-    // This variant implements free drawing (no timer) plus toolbar controls:
-    // - paintColor, paintSize, eraserMode, drawingEnabled
+  // inline plugin modes: runnerControlModule and simonProModule (consolidated)
+  if (currentGameId === 'runner-control') {
+    try {
+      runnerControlModule.update(dt, mappedHands);
+    } catch (e) { console.warn('runner-control update failed', e); }
+  } else if (currentGameId === 'maze-mini') {
+    try {
+      mazeModule.update(dt, mappedHands);
+    } catch (e) { console.warn('maze update failed', e); }
+  } else if (currentGameId === 'paint-air') {
     try {
       const nowT = performance.now();
-      let addedLen = 0;
+      const handCount = mappedHands.length;
 
-      if (mappedHands[0] && mappedHands[0][8] && running) {
-        const pt = mappedHands[0][8];
-        const prev = paintPaths.length ? paintPaths[paintPaths.length - 1] : null;
+      // two-hand auto-stop logic
+      if (handCount >= 2 && running && drawingEnabled) {
+        // stop drawing temporarily and mark separation
+        autoStoppedByTwoHands = true;
+        drawingEnabled = false;
+        // add separator so next stroke doesn't connect
+        paintPaths.push(null);
+        noticeEl.textContent = 'Two hands detected — drawing paused';
+      } else if (handCount < 2 && autoStoppedByTwoHands) {
+        // resume drawing, but start a fresh stroke (separator already pushed)
+        autoStoppedByTwoHands = false;
+        drawingEnabled = true;
+        noticeEl.textContent = 'Drawing resumed';
+        // ensure separation (in case separator wasn't pushed earlier)
+        if (paintPaths.length === 0 || paintPaths[paintPaths.length - 1] !== null) paintPaths.push(null);
+      }
 
-        // Record or erase points based on toolbar state
-        if (drawingEnabled) {
-          if (eraserMode) {
-            // Erase nearby points from paintPaths (simple point-based erase)
-            const eraseRadius = Math.max(8, (paintSize || 12) * 0.8);
-            for (let i = paintPaths.length - 1; i >= 0; i--) {
-              const p = paintPaths[i];
-              if (Math.hypot(p.x - pt.x, p.y - pt.y) <= eraseRadius) {
-                paintPaths.splice(i, 1);
+      // current fingertip if available
+      const tip = (mappedHands[0] && mappedHands[0][8]) ? mappedHands[0][8] : null;
+
+      // handle eraser mode using spatial buckets and lazy deletion (faster, less GC churn)
+      if (eraserMode && tip && running) {
+        const eraseRadius = Math.max(8, (paintSize || 12) * 1.4);
+        // throttle eraser processing to ~25 Hz to avoid heavy per-frame work
+        if (!window.__handNinja._lastEraserProcess || nowT - window.__handNinja._lastEraserProcess > 40) {
+          const keys = getBucketKeysForCircle(tip.x, tip.y, eraseRadius);
+          let removed = 0;
+          for (const k of keys) {
+            const bucket = paintBuckets.get(k);
+            if (!bucket || !bucket.length) continue;
+            for (const pt of bucket) {
+              if (!pt || pt._deleted) continue;
+              const d = Math.hypot(pt.x - tip.x, pt.y - tip.y);
+              if (d <= eraseRadius) {
+                pt._deleted = true;
+                removed++;
+                deletedCount++;
               }
             }
-          } else {
-            // Normal drawing: append point
-            paintPaths.push({ x: pt.x, y: pt.y, t: nowT });
-            if (paintPaths.length > 20000) paintPaths.splice(0, paintPaths.length - 20000);
           }
-        }
-
-        if (prev) addedLen = Math.hypot(pt.x - prev.x, pt.y - prev.y);
-
-        // determine if the new point is close to the target track (only count when drawing)
-        let onTrack = false;
-        const threshold = 30; // pixels tolerance
-        if (!eraserMode && paintTrack.length) {
-          for (let i = 0; i < paintTrack.length - 1; i++) {
-            const a = paintTrack[i], b = paintTrack[i+1];
-            const d = segmentCircleDist(a.x,a.y,b.x,b.y, pt.x, pt.y);
-            if (d <= threshold) { onTrack = true; break; }
+          if (removed && (!window.__handNinja._lastEraserSound || nowT - window.__handNinja._lastEraserSound > 120)) {
+            try { playSound('pop_small'); } catch(e){}
+            window.__handNinja._lastEraserSound = nowT;
           }
-          if (onTrack && addedLen > 0.6) {
-            paintOnTrackLen += addedLen;
+          window.__handNinja._lastEraserProcess = nowT;
+
+          // occasionally compact storage to reclaim memory and shrink render cost
+          if (deletedCount > 800 && paintPaths.length > 2000) {
+            compactPaintStorage();
           }
         }
       }
 
-      // draw target track (dashed)
-      if (paintTrack.length) {
-        ctx.save();
-        ctx.lineWidth = 6;
-        ctx.strokeStyle = 'rgba(220,220,220,0.75)';
-        ctx.setLineDash([10,8]);
-        ctx.beginPath();
-        for (let i = 0; i < paintTrack.length; i++) {
-          const p = paintTrack[i];
-          if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      // Record new point when drawingEnabled and not erasing
+      if (tip && running && drawingEnabled && !eraserMode) {
+        // Throttle sampling: only record if moved sufficiently or enough time passed
+        // Find last non-null, non-deleted point
+        let lastNonNull = null;
+        for (let i = paintPaths.length - 1; i >= 0; i--) {
+          const q = paintPaths[i];
+          if (q === null) { lastNonNull = null; break; }
+          if (q && !q._deleted) { lastNonNull = q; break; }
         }
-        ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.restore();
+        const dx = lastNonNull ? Math.hypot(tip.x - lastNonNull.x, tip.y - lastNonNull.y) : Infinity;
+        const dtPush = nowT - (lastPaintPushT || 0);
+        const minDist = Math.max(1, (paintSize || 12) * 0.25);
+        if (dx > minDist || dtPush > 35) {
+          const pt = { x: tip.x, y: tip.y, t: nowT, color: paintColor || '#00b4ff', size: paintSize || 12, _deleted: false };
+          paintPaths.push(pt);
+          addPointToBucket(pt);
+          lastPaintPushT = nowT;
+          // bounded growth: compact a bit if extremely large
+          if (paintPaths.length > 12000 && deletedCount > 2000) compactPaintStorage();
+
+          // if painting on-track compute length using last non-deleted point
+          if (lastNonNull) {
+            const addedLen = Math.hypot(pt.x - lastNonNull.x, pt.y - lastNonNull.y);
+            let onTrack = false;
+            const threshold = 30;
+            if (paintTrack.length) {
+              for (let i = 0; i < paintTrack.length - 1; i++) {
+                const a = paintTrack[i], b = paintTrack[i+1];
+                const d = segmentCircleDist(a.x,a.y,b.x,b.y, pt.x, pt.y);
+                if (d <= threshold) { onTrack = true; break; }
+              }
+            }
+            if (onTrack && addedLen > 0.6) paintOnTrackLen += addedLen;
+          }
+        }
       }
 
-      // draw user paint path using toolbar color/size
+      // Rendering: iterate paintPaths, respect separators (null) and per-point color/size.
+      // Skip points that fall inside any erase mask.
+      // Draw strokes by honoring separators and point-level styles (skip deleted points)
       if (paintPaths.length) {
-        ctx.save();
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
-        ctx.strokeStyle = paintColor || 'rgba(0,180,255,0.95)';
-        ctx.lineWidth = paintSize || 12;
-        ctx.beginPath();
+        let started = false;
+        let lastColor = null, lastSize = null;
         for (let i = 0; i < paintPaths.length; i++) {
           const p = paintPaths[i];
-          if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+          if (p === null) {
+            // separator: end any current stroke
+            started = false;
+            continue;
+          }
+          if (p && p._deleted) continue; // skip erased points
+          // if we need to begin a new sub-path or style changed
+          const color = p.color || paintColor;
+          const size = p.size || paintSize;
+          if (!started || color !== lastColor || size !== lastSize) {
+            ctx.beginPath();
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.strokeStyle = color;
+            ctx.lineWidth = size;
+            // find previous non-deleted point in this subpath to moveTo
+            let moved = false;
+            for (let j = i - 1; j >= 0; j--) {
+              const q = paintPaths[j];
+              if (q === null) break;
+              if (q && !q._deleted) { ctx.moveTo(q.x, q.y); moved = true; break; }
+            }
+            if (!moved) ctx.moveTo(p.x, p.y);
+            ctx.lineTo(p.x, p.y);
+            ctx.stroke();
+            started = true;
+            lastColor = color;
+            lastSize = size;
+          } else {
+            // continue same stroke style; draw segment
+            ctx.beginPath();
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.strokeStyle = lastColor;
+            ctx.lineWidth = lastSize;
+            // find previous drawable non-deleted point
+            let prevPoint = null;
+            for (let j = i - 1; j >= 0; j--) {
+              const q = paintPaths[j];
+              if (q === null) break;
+              if (q && !q._deleted) { prevPoint = q; break; }
+            }
+            if (prevPoint) {
+              ctx.moveTo(prevPoint.x, prevPoint.y);
+              ctx.lineTo(p.x, p.y);
+              ctx.stroke();
+            } else {
+              ctx.moveTo(p.x, p.y);
+              ctx.lineTo(p.x, p.y);
+              ctx.stroke();
+            }
+          }
         }
-        ctx.stroke();
-        ctx.restore();
       }
 
-      // update score based on on-track painted length (scaled)
-      const newScore = Math.min(9999, Math.floor(paintOnTrackLen / 12));
-      if (newScore !== score) {
-        score = newScore;
-        updateUI();
-      }
-
-      // optional debug dot at last point
-      if (paintPaths.length) {
-        const lp = paintPaths[paintPaths.length - 1];
-        ctx.beginPath();
-        ctx.fillStyle = 'rgba(255,255,255,0.9)';
-        ctx.arc(lp.x, lp.y, 6, 0, Math.PI*2);
-        ctx.fill();
-      }
-    } catch(e){ console.warn('paint-air onResults error', e); }
+    } catch (e) {
+      console.warn('paint-air onResults error', e);
+    }
   } else if (currentGameId === 'shape-trace') {
     // Shape Trace: player must trace the current shape outline; when coverage >= threshold move to next shape
     try {
@@ -1106,6 +1906,8 @@ function onResults(results) {
         const s = generateRandomShape();
         shapes.push(s);
         shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
+        // reset incremental covered counter
+        window.__handNinja._shapeCoveredCount = 0;
         shapeIndex = 0;
         shapeProgress = 0;
       }
@@ -1113,32 +1915,171 @@ function onResults(results) {
         const pt = mappedHands[0][8];
         // check proximity to each segment and mark covered
         const s = shapes[shapeIndex];
-        for (let i = 0; i < s.points.length - 1; i++) {
-          if (shapeCovered[i]) continue;
-          const a = s.points[i], b = s.points[i+1];
+        // Localized, throttled scan to avoid full per-frame work when user moves very fast.
+        const nowT = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        if (!window.__handNinja._lastShapeScanIndex) window.__handNinja._lastShapeScanIndex = 0;
+        if (!window.__handNinja._lastFullShapeScan) window.__handNinja._lastFullShapeScan = 0;
+        const lastIdx = window.__handNinja._lastShapeScanIndex || 0;
+        const SEG_COUNT = Math.max(0, s.points.length - 1);
+        const newlyCovered = [];
+        const MAX_SEGMENTS_PER_FRAME = 3;
+        const SCAN_RADIUS = 6; // tuneable: how many segments either side to probe first
+
+        // per-frame soft cap to avoid huge bursts of marking work when users move very fast
+        let marksThisFrame = 0;
+        const MARK_LIMIT_PER_FRAME = Math.max(4, MAX_SEGMENTS_PER_FRAME * 3);
+        // neighbor fill threshold tuned lower to avoid cascading fills
+        const extraNeighborThreshold = 44; // px
+
+        // small helper to test & mark a single segment index
+        function tryMark(i) {
+          if (SEG_COUNT <= 0) return;
+          if (marksThisFrame >= MARK_LIMIT_PER_FRAME) return;
+          const idx = ((i % SEG_COUNT) + SEG_COUNT) % SEG_COUNT;
+          if (shapeCovered[idx]) return;
+          const a = s.points[idx], b = s.points[idx + 1];
+          // distance to segment plus distances to segment endpoints (helps corners)
           const d = segmentCircleDist(a.x,a.y,b.x,b.y, pt.x, pt.y);
-          if (d <= shapeTolerance) {
-            shapeCovered[i] = true;
-            // award small incremental points per covered segment
-            score += 2;
-            spawnPopup(pt.x, pt.y, '+2', { col: 'cyan', size: 14 });
-            // Play segment_complete when this connects to adjacent covered segments, otherwise play point
-            try {
-              const L = shapeCovered.length;
-              const prev = shapeCovered[(i - 1 + L) % L];
-              const next = shapeCovered[(i + 1) % L];
-              if (prev || next) {
+          const da = Math.hypot(pt.x - a.x, pt.y - a.y);
+          const db = Math.hypot(pt.x - b.x, pt.y - b.y);
+          // additional info to help mark small neighbors
+          const segLen = Math.hypot(a.x - b.x, a.y - b.y);
+
+          if (d <= shapeTolerance || da <= shapeTolerance || db <= shapeTolerance) {
+            const prevAdj = shapeCovered[(idx - 1 + SEG_COUNT) % SEG_COUNT];
+            const nextAdj = shapeCovered[(idx + 1) % SEG_COUNT];
+
+            // mark this segment
+            shapeCovered[idx] = true;
+            marksThisFrame++;
+            // maintain incremental covered count to avoid O(n) reductions each frame
+            window.__handNinja._shapeCoveredCount = (window.__handNinja._shapeCoveredCount || 0) + 1;
+            newlyCovered.push({ idx, adj: !!(prevAdj || nextAdj) });
+            window.__handNinja._lastShapeScanIndex = idx;
+
+            // mark immediate neighbors conservatively (only if within tolerance and under mark cap)
+            if (marksThisFrame < MARK_LIMIT_PER_FRAME && da <= shapeTolerance) {
+              const prevIdx = (idx - 1 + SEG_COUNT) % SEG_COUNT;
+              if (!shapeCovered[prevIdx]) {
+                shapeCovered[prevIdx] = true;
+                marksThisFrame++;
+                window.__handNinja._shapeCoveredCount = (window.__handNinja._shapeCoveredCount || 0) + 1;
+                newlyCovered.push({ idx: prevIdx, adj: true });
+              }
+            }
+            if (marksThisFrame < MARK_LIMIT_PER_FRAME && db <= shapeTolerance) {
+              const nextIdx = (idx + 1) % SEG_COUNT;
+              if (!shapeCovered[nextIdx]) {
+                shapeCovered[nextIdx] = true;
+                marksThisFrame++;
+                window.__handNinja._shapeCoveredCount = (window.__handNinja._shapeCoveredCount || 0) + 1;
+                newlyCovered.push({ idx: nextIdx, adj: true });
+              }
+            }
+
+            // optionally fill one extra neighbor for very short segments (but respect mark cap)
+            if (segLen <= extraNeighborThreshold && marksThisFrame < MARK_LIMIT_PER_FRAME) {
+              const extraIdx = (da <= db) ? ((idx - 2 + SEG_COUNT) % SEG_COUNT) : ((idx + 2) % SEG_COUNT);
+              if (!shapeCovered[extraIdx]) {
+                shapeCovered[extraIdx] = true;
+                marksThisFrame++;
+                window.__handNinja._shapeCoveredCount = (window.__handNinja._shapeCoveredCount || 0) + 1;
+                newlyCovered.push({ idx: extraIdx, adj: true });
+              }
+            }
+          }
+        }
+
+        // 1) Scan neighborhood around last hit (cheap, O(radius))
+        for (let off = 0; off <= SCAN_RADIUS && newlyCovered.length < MAX_SEGMENTS_PER_FRAME; off++) {
+          tryMark(lastIdx + off);
+          if (off > 0) tryMark(lastIdx - off);
+        }
+
+        // 2) If nothing found and full-scan cooldown elapsed, do a throttled full scan
+        const FULL_SCAN_COOLDOWN = 200; // ms
+        if (newlyCovered.length === 0 && nowT - (window.__handNinja._lastFullShapeScan || 0) > FULL_SCAN_COOLDOWN) {
+          for (let i = 0; i < SEG_COUNT && newlyCovered.length < MAX_SEGMENTS_PER_FRAME; i++) {
+            tryMark(i);
+          }
+          window.__handNinja._lastFullShapeScan = nowT;
+        }
+
+        // 3) If we found any, aggregate feedback (single popup, single sound) to reduce per-frame work.
+        // Throttle visual/audio feedback to avoid spikes when many segments are marked in a short time.
+        if (newlyCovered.length > 0) {
+          const totalPoints = newlyCovered.length * 2;
+          score += totalPoints;
+          updateUI();
+          const firstIdx = newlyCovered[0].idx;
+          const a0 = s.points[firstIdx], b0 = s.points[firstIdx + 1];
+          const px = (a0.x + b0.x) / 2;
+          const py = (a0.y + b0.y) / 2;
+
+          const FEEDBACK_THROTTLE_MS = 120;
+          const lastFeedback = window.__handNinja._lastShapeFeedbackTime || 0;
+          if (SEG_COUNT <= 80 && (Date.now() - lastFeedback) > FEEDBACK_THROTTLE_MS) {
+            spawnPopup(px, py, `+${totalPoints}`, { col: 'cyan', size: 14 });
+          }
+
+          try {
+            // audio: only play occasional aggregated sounds to avoid audio thrash and main-thread stalls
+            if ((Date.now() - lastFeedback) > FEEDBACK_THROTTLE_MS) {
+              const anyAdj = newlyCovered.some(n => n.adj);
+              if (anyAdj || newlyCovered.length > 1) {
                 playSound('segment_complete');
               } else {
                 playSound('point');
               }
-            } catch(e){}
-            updateUI();
-          }
+              window.__handNinja._lastShapeFeedbackTime = Date.now();
+            }
+          } catch (e) {}
         }
-        // compute progress
-        const covered = shapeCovered.reduce((s1,x)=> s1 + (x?1:0), 0);
-        shapeProgress = covered / shapeCovered.length;
+
+        // Gap-fill pass: only consider small nearby gaps adjacent to newlyMarked segments
+        (function gapFillPass(){
+          if (!shapeCovered || shapeCovered.length <= 2 || !newlyCovered || newlyCovered.length === 0) return;
+          // compute approximate perimeter to derive adaptive threshold
+          let perimeter = 0;
+          for (let i = 0; i < s.points.length - 1; i++) {
+            const a = s.points[i], b = s.points[i+1];
+            perimeter += Math.hypot(a.x - b.x, a.y - b.y);
+          }
+          const gapLengthThreshold = Math.max(40, perimeter * 0.022); // 2.2% of perimeter or 40px minimum
+
+          // collect candidate indices near newlyCovered hits (±1 and ±2)
+          const candidates = new Set();
+          const N = shapeCovered.length;
+          for (const nc of newlyCovered) {
+            const base = ((nc && typeof nc.idx === 'number') ? nc.idx : null);
+            if (base === null) continue;
+            candidates.add(((base - 2) % N + N) % N);
+            candidates.add(((base - 1) % N + N) % N);
+            candidates.add(base % N);
+            candidates.add(((base + 1) % N + N) % N);
+            candidates.add(((base + 2) % N + N) % N);
+          }
+
+          for (const i of candidates) {
+            if (shapeCovered[i]) continue;
+            const prev = shapeCovered[(i - 1 + N) % N];
+            const next = shapeCovered[(i + 1) % N];
+            // only fill isolated 1-gap holes (both neighbors covered)
+            if (prev && next) {
+              const a = s.points[i], b = s.points[i+1];
+              const segLen = Math.hypot(a.x - b.x, a.y - b.y);
+              if (segLen <= gapLengthThreshold) {
+                shapeCovered[i] = true;
+                window.__handNinja._shapeCoveredCount = (window.__handNinja._shapeCoveredCount || 0) + 1;
+                if (SEG_COUNT <= 80) spawnPopup((a.x + b.x) / 2, (a.y + b.y) / 2, '+auto', { col: 'cyan', size: 12 });
+              }
+            }
+          }
+        })();
+
+        // compute progress using incremental counter (faster than reduce)
+        const covered = (window.__handNinja._shapeCoveredCount || 0);
+        shapeProgress = shapeCovered.length ? covered / shapeCovered.length : 0;
         // if shape sufficiently covered, move to next
         if (shapeProgress >= 0.95) {
           try { playSound('shape_complete'); } catch(e){}
@@ -1150,6 +2091,8 @@ function onResults(results) {
           shapes.push(next);
           shapeIndex++;
           shapeCovered = new Array(Math.max(0, next.points.length - 1)).fill(false);
+          // reset incremental covered counter for the new shape
+          window.__handNinja._shapeCoveredCount = 0;
           shapeProgress = 0;
           // reset paint path for clarity
           paintPaths.length = 0;
@@ -1201,6 +2144,113 @@ function onResults(results) {
         } catch(e){}
       }
     } catch(e){ console.warn('shape-trace error', e); }
+
+  } else if (currentGameId === 'simon-gesture') {
+    // Simon Gesture: memory/sequencing game using simple gestures (open, closed, pinch)
+    try {
+      if (!window.__handNinja._simon) {
+        const gestureOptions = ['open','closed','pinch'];
+        window.__handNinja._simon = {
+          seq: [gestureOptions[randInt(0,gestureOptions.length-1)], gestureOptions[randInt(0,gestureOptions.length-1)], gestureOptions[randInt(0,gestureOptions.length-1)]],
+          showing: true,
+          cueIdx: -1,
+          lastCueT: now,
+          awaitingInput: false,
+          userStep: 0,
+          _lastInputT: 0
+        };
+        noticeEl.textContent = 'Simon — watch the sequence';
+      }
+      const sim = window.__handNinja._simon;
+      const gestureOptions = ['open','closed','pinch'];
+      // show cues every 700ms when showing
+      if (sim.showing) {
+        if (now - sim.lastCueT > 700) {
+          sim.lastCueT = now;
+          sim.cueIdx++;
+          if (sim.cueIdx >= sim.seq.length) {
+            sim.showing = false;
+            sim.awaitingInput = true;
+            sim.userStep = 0;
+            sim.cueIdx = -1;
+            noticeEl.textContent = 'Your turn';
+            try { playSound('popup'); } catch(e){}
+          } else {
+            spawnPopup(canvas.width/(2*DPR), 60, sim.seq[sim.cueIdx], { col: 'yellow', size: 22 });
+            try { playSound('point'); } catch(e){}
+          }
+        }
+      } else if (sim.awaitingInput) {
+        if (mappedHands[0]) {
+          const gest = detectSimpleGesture(mappedHands[0]);
+          if (gest && now - (sim._lastInputT || 0) > 350) {
+            sim._lastInputT = now;
+            if (gest === sim.seq[sim.userStep]) {
+              sim.userStep++;
+              spawnPopup(canvas.width/(2*DPR), 60, 'OK', { col: 'lime', size: 20 });
+              try { playSound('segment_complete'); } catch(e){}
+              if (sim.userStep >= sim.seq.length) {
+                // success: extend sequence and show next round
+                sim.seq.push(gestureOptions[randInt(0, gestureOptions.length - 1)]);
+                sim.showing = true;
+                sim.awaitingInput = false;
+                sim.cueIdx = -1;
+                sim.lastCueT = now + 300;
+                score += 30;
+                updateUI();
+                noticeEl.textContent = 'Good! Watch next';
+              }
+            } else {
+              // wrong input: shorten sequence slightly and retry
+              spawnPopup(canvas.width/(2*DPR), 60, 'Wrong', { col: 'red', size: 20 });
+              try { playSound('wrong'); } catch(e){}
+              sim.seq = sim.seq.slice(0, Math.max(3, sim.seq.length - 1));
+              sim.showing = true;
+              sim.awaitingInput = false;
+              sim.cueIdx = -1;
+              sim.lastCueT = now + 600;
+              noticeEl.textContent = 'Try again';
+            }
+          }
+        }
+      }
+    } catch(e){ console.warn('simon-gesture error', e); }
+
+  } else if (currentGameId === 'follow-dot') {
+    // Follow-the-dot: moving target; keep fingertip close to score points
+    try {
+      if (!window.__handNinja._follow) {
+        const w = canvas.width / DPR, h = canvas.height / DPR;
+        window.__handNinja._follow = { x: rand(80,w-80), y: rand(80,h-80), vx: rand(-160,160), vy: rand(-120,120), lastMove: now, scoreAccum: 0 };
+      }
+      const f = window.__handNinja._follow;
+      const dtF = Math.max(0, (now - (f.lastMove || now)) / 1000);
+      f.lastMove = now;
+      f.x += f.vx * dtF; f.y += f.vy * dtF;
+      if (f.x < 40 || f.x > canvas.width / DPR - 40) f.vx *= -1;
+      if (f.y < 40 || f.y > canvas.height / DPR - 40) f.vy *= -1;
+      // draw moving target
+      ctx.beginPath();
+      ctx.fillStyle = 'orange';
+      ctx.arc(f.x, f.y, 12, 0, Math.PI * 2);
+      ctx.fill();
+      // fingertip proximity check
+      const tip = (mappedHands[0] && mappedHands[0][8]) ? mappedHands[0][8] : null;
+      if (tip && running) {
+        const d = Math.hypot(tip.x - f.x, tip.y - f.y);
+        if (d < 36) {
+          f.scoreAccum += dtF;
+          if (f.scoreAccum >= 0.7) {
+            score += 5;
+            spawnPopup(f.x, f.y, '+5', { col: 'orange', size: 16 });
+            updateUI();
+            f.scoreAccum = 0;
+          }
+        } else {
+          f.scoreAccum = Math.max(0, f.scoreAccum - dtF * 2);
+        }
+      }
+    } catch(e){ console.warn('follow-dot error', e); }
   }
 
   // collision detection: only active for ninja-fruit mode
@@ -1289,6 +2339,28 @@ async function startGame() {
         popup: 'assets/shape-track-game/sfx_popup.mp3',
         wrong: 'assets/shape-track-game/sfx_wrong.mp3'
       };
+    } else if (currentGameId === 'runner-control') {
+      // runner-control: simple SFX set for jumps, hits and points
+      ASSETS.bgm = 'assets/Runner-Control/bgm_runner_loop.mp3';
+      ASSETS.slice = null;
+      ASSETS.bomb = null;
+      ASSETS.sfx = {
+        point: 'assets/Runner-Control/sfx_point.mp3',
+        bomb: 'assets/Runner-Control/sfx_hit.mp3',
+        popup: 'assets/Runner-Control/sfx_popup.mp3',
+        jump: 'assets/Runner-Control/sfx_jump.mp3'
+      };
+    } else if (currentGameId === 'maze-mini') {
+      // maze-mini: audio cues for tokens and feedback
+      ASSETS.bgm = 'assets/Maze/bgm_maze_loop.mp3';
+      ASSETS.slice = null;
+      ASSETS.bomb = null;
+      ASSETS.sfx = {
+        point: 'assets/Maze/sfx_point.mp3',
+        segment_complete: 'assets/Maze/sfx_segment_complete.mp3',
+        wrong: 'assets/Maze/sfx_wrong.mp3',
+        popup: 'assets/Maze/sfx_popup.mp3'
+      };
     } else {
       ASSETS.bgm = `assets/${currentGameId}/bgm.mp3`;
       ASSETS.slice = `assets/${currentGameId}/slice.wav`;
@@ -1344,7 +2416,17 @@ async function startGame() {
       const s = generateRandomShape();
       shapes.push(s);
       shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
+      // reset incremental covered counter
+      window.__handNinja._shapeCoveredCount = 0;
       noticeEl.textContent = 'Shape Trace — trace the shape outline to fill it';
+    } else if (currentGameId === 'runner-control') {
+      // initialize runner control inline module
+      try { runnerControlModule.onStart && runnerControlModule.onStart(); } catch(e){ console.warn('runner start failed', e); }
+      noticeEl.textContent = 'Runner Control — stay alive!';
+    } else if (currentGameId === 'maze-mini') {
+      // initialize mini maze only
+      try { mazeModule.onStart && mazeModule.onStart(); } catch(e){ console.warn('maze start failed', e); }
+      noticeEl.textContent = 'Maze (Mini) — reach any highlighted exit';
     } else {
       // default to ninja fruit behavior
       objects.length = 0;
@@ -1421,7 +2503,6 @@ clearLeadersBtn.addEventListener('click', ()=> clearLeaders());
 
 /* Export removed — leaderboard now strictly per-game to keep UI minimal. */
 
-
 /* music controls: keep only the in-game/top UI music checkbox.
    Removed the menu music toggle (it caused overlapping BGM tied to
    the ninja shared bgm file). Per-game music is controlled via the
@@ -1496,10 +2577,12 @@ if (clearTrackBtn) {
       noticeEl.textContent = 'Track cleared';
       try { playSound('clear'); } catch(e){}
     }
-    if (currentGameId === 'shape-trace') {
+      if (currentGameId === 'shape-trace') {
       shapes.length = 0;
       shapeCovered = [];
       shapeProgress = 0;
+      // reset incremental covered counter
+      window.__handNinja._shapeCoveredCount = 0;
       noticeEl.textContent = 'Shape cleared';
       try { playSound('popup'); } catch(e){}
     }
