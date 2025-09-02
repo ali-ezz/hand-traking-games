@@ -1,4 +1,4 @@
-# Camera Hand‑Tracking Games
+# Camera Hand‑Tracking Games 📷
 
 A tiny, polished suite of hand‑tracking mini‑games that run in the browser using MediaPipe Hands and an HTML5 canvas. Use your webcam and your index finger to play fast, fun demos — slice fruits, trace shapes, paint in the air, navigate mazes, and more.
 
