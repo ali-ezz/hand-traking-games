@@ -71,9 +71,19 @@ task_progress
           </select>
         </div>
 
-        <div style="display:flex; gap:8px; justify-content:center; margin-bottom:8px;">
+        <div style="display:flex; gap:8px; justify-content:center; margin-bottom:8px; align-items:center;">
           <button id="menuStartBtn" class="btn">Play</button>
           <button id="showLeadersBtn" class="btn">Leaderboard</button>
+          <button id="createRoomBtn" class="btn">Create Room</button>
+
+          <!-- Join by ID input + button -->
+          <input id="roomIdInput" placeholder="Room ID" style="padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.02); color:#fff; width:110px;" />
+          <button id="joinByIdBtn" class="btn">Join by ID</button>
+
+          <!-- Show available public rooms -->
+          <button id="showRoomsBtn" class="btn">Show Rooms</button>
+
+          <span id="roomIdDisplay" style="margin-left:8px; padding:6px 10px; background:rgba(255,255,255,0.03); border-radius:8px; font-size:13px;">Room: -</span>
         </div>
 
 
@@ -140,6 +150,16 @@ task_progress
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <!-- Socket.IO client (required before modules that use window.io) -->
+  <script>
+    // If you host the client on Vercel, set this to your Socket.IO server URL.
+    // Example: 'https://your-socket-server.example'
+    // Replace the placeholder below with your deployed server domain.
+    window.MULTI_SERVER_URL = window.MULTI_SERVER_URL || 'https://YOUR_SOCKET_SERVER';
+  </script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script type="module" src="js/ui.js"></script>
 
   <!-- Game logic -->
   <script type="module" src="js/game.js"></script>
