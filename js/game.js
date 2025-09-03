@@ -15,15 +15,7 @@
 // js/game.js — core game logic (modified to wire assets, popups, and robustness)
 // Loads via <script type="module" src="js/game.js"></script>
 
-import * as Net from './net.js';
 const DPR = Math.max(1, window.devicePixelRatio || 1);
-
-// Networking: throttle and lightweight peer state for ghost rendering
-const NET_THROTTLE_MS = 83; // ~12 Hz
-if (!window.__handNinja) window.__handNinja = {};
-window.__handNinja._lastNetSendT = window.__handNinja._lastNetSendT || 0;
-// local smoothing state for remote peers: id -> { x, y, lastT, alpha }
-const netPeersState = new Map();
 
 // UI elements
 const videoEl = document.getElementById('input_video');
@@ -952,119 +944,6 @@ function mapLandmarksToCanvas(landmarks, results) {
   }));
 }
 
-// Render remote peers (ghosts) with light interpolation.
-// Expects Net.getPeers() to provide Map(id -> { id, t, p, ... })
-// p is expected to be an array of quantized points: [[qx,qy],[qx2,qy2]] where q in 0..1000
-function drawPeers(dt) {
-  try {
-    const peersMap = Net.getPeers();
-    const playersMeta = (typeof Net.getPlayers === 'function') ? Net.getPlayers() : [];
-    const now = performance.now();
-    const W = canvas.width / DPR, H = canvas.height / DPR;
-    const deq = (v, dim) => (v / 1000) * dim;
-
-    for (const [id, msg] of peersMap.entries()) {
-      if (!msg || !id) continue;
-
-      // handle explicit clear messages (server broadcasts clear_layer as clear flag)
-      if (msg.clear) {
-        const st = netPeersState.get(id);
-        if (st) {
-          ctx.save();
-          ctx.globalAlpha = 0.9;
-          ctx.strokeStyle = 'rgba(255,90,90,0.95)';
-          ctx.lineWidth = 3;
-          ctx.beginPath();
-          ctx.moveTo(st.x - 12, st.y - 12);
-          ctx.lineTo(st.x + 12, st.y + 12);
-          ctx.moveTo(st.x + 12, st.y - 12);
-          ctx.lineTo(st.x - 12, st.y + 12);
-          ctx.stroke();
-          ctx.restore();
-        }
-        continue;
-      }
-
-      let targetX = null, targetY = null;
-      if (Array.isArray(msg.p) && Array.isArray(msg.p[0])) {
-        // use first point (wrist) as anchor; fallback to tip if only one point
-        const q0 = msg.p[0];
-        targetX = deq(Number(q0[0] || 0), W);
-        targetY = deq(Number(q0[1] || 0), H);
-      } else {
-        // unknown payload shape; skip
-        continue;
-      }
-
-      const prev = netPeersState.get(id);
-      if (!prev) {
-        netPeersState.set(id, { x: targetX, y: targetY, lastT: now, alpha: 1.0 });
-      } else {
-        // smooth toward target
-        const blend = Math.min(1, dt * 12);
-        prev.x += (targetX - prev.x) * blend;
-        prev.y += (targetY - prev.y) * blend;
-        prev.lastT = now;
-        prev.alpha = 1.0;
-      }
-
-      const state = netPeersState.get(id);
-      if (!state) continue;
-
-      // draw ghost circle + name label
-      ctx.save();
-      ctx.globalAlpha = 0.36;
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.arc(state.x, state.y, 10, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 0.5;
-      ctx.strokeStyle = 'rgba(255,255,255,0.28)';
-      ctx.lineWidth = 1.75;
-      ctx.stroke();
-
-      // draw small finger line if tip was provided
-      if (Array.isArray(msg.p) && Array.isArray(msg.p[1])) {
-        const qTip = msg.p[1];
-        const tx = deq(Number(qTip[0] || 0), W);
-        const ty = deq(Number(qTip[1] || 0), H);
-        ctx.beginPath();
-        ctx.globalAlpha = 0.45;
-        ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-        ctx.lineWidth = 2;
-        ctx.moveTo(state.x, state.y);
-        ctx.lineTo(tx, ty);
-        ctx.stroke();
-      }
-
-      // draw player name above ghost if known
-      let name = null;
-      if (Array.isArray(playersMeta) && playersMeta.length) {
-        const meta = playersMeta.find(p => p && (p.id === id || p.socketId === id));
-        if (meta && meta.name) name = meta.name;
-      }
-      if (!name) {
-        // fallback short id
-        try { name = `P-${String(id).slice(0,4)}`; } catch(e){ name = 'P'; }
-      }
-      ctx.globalAlpha = 0.95;
-      ctx.fillStyle = 'rgba(255,255,255,0.95)';
-      ctx.font = '12px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(name, state.x, state.y - 14);
-      ctx.restore();
-    }
-
-    // garbage collect stale peer states
-    for (const [id, st] of netPeersState.entries()) {
-      if (now - (st.lastT || 0) > 2200) netPeersState.delete(id);
-    }
-  } catch (e) {
-    // non-fatal, don't break rendering
-    // console.warn('drawPeers error', e);
-  }
-}
-
  // Generate random shape outlines (returns { points: [{x,y}], type })
 function generateRandomShape() {
   const w = canvas.width / DPR;
@@ -1835,26 +1714,6 @@ function onResults(results) {
   const allLandmarks = results.multiHandLandmarks || [];
   const mappedHands = allLandmarks.map(landmarks => mapLandmarksToCanvas(landmarks, results));
 
-  // send compact network update (throttled)
-  try {
-    const nowNet = performance.now();
-    if (Net && typeof Net.sendPlayerUpdate === 'function' && nowNet - (window.__handNinja._lastNetSendT || 0) >= NET_THROTTLE_MS) {
-      window.__handNinja._lastNetSendT = nowNet;
-      const W = canvas.width / DPR, H = canvas.height / DPR;
-      const q = (v, dim) => Math.max(0, Math.min(1000, Math.round((v / dim) * 1000)));
-      if (mappedHands && mappedHands[0] && mappedHands[0][8]) {
-        const h0 = mappedHands[0];
-        const wrist = h0[0];
-        const tip = h0[8];
-        const payload = { t: Date.now(), p: [ [q(wrist.x, W), q(wrist.y, H)], [q(tip.x, W), q(tip.y, H)] ] };
-        Net.sendPlayerUpdate(payload);
-      } else {
-        // no hand visible — still send a light presence heartbeat
-        Net.sendPlayerUpdate({ t: Date.now() });
-      }
-    }
-  } catch(e) { /* non-fatal */ }
-
   // draw light hand trails (for user feedback)
   ctx.lineWidth = 6;
   ctx.strokeStyle = 'rgba(255,255,255,0.6)';
@@ -2410,8 +2269,6 @@ function onResults(results) {
     }
   }
 
-  // draw peers (ghosts) from network
-  try { drawPeers(dt); } catch(e) {}
   // draw particles on top
   drawParticles(dt);
   // draw floating popups
