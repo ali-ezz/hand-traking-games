@@ -55,14 +55,14 @@
   ],
   "runner-control": [
     {
+      "name": "Player",
+      "score": 170,
+      "ts": 1757082871107
+    },
+    {
       "name": "Huhu",
       "score": 85,
       "ts": 1757045749573
-    },
-    {
-      "name": "Player",
-      "score": 75,
-      "ts": 1756945279778
     }
   ],
   "shape-trace": [
