@@ -110,6 +110,14 @@ function showWaitingForPlayersOverlay(show, text) {
     const inner = el.querySelector('#waitingOverlayInner');
     if (inner && text) inner.textContent = text;
     el.style.display = show ? 'flex' : 'none';
+    
+    // Ensure canvas is visible even when overlay is shown
+    try {
+      const canvas = document.getElementById('output_canvas');
+      if (canvas) {
+        canvas.style.visibility = 'visible';
+      }
+    } catch(e) {}
   } catch (e) { /* ignore overlay failures */ }
 }
 
@@ -130,6 +138,12 @@ let score = 0;
 const NET_QUANT_MAX = 1000;
 const peerGhosts = Object.create(null); // id -> { target: [{x,y,z}], display: [{x,y,z}], lastTs }
 const peerPaints = Object.create(null); // id -> [ {x,y,t,color,size} ]
+
+// Multiplayer game state synchronization
+let serverGameState = null; // Server-generated game state
+let roomScores = {}; // Per-player scores from server
+let localPlayerId = null; // Local player's socket ID
+let isMultiplayerGame = false; // Whether we're in a multiplayer room game
 
 // Physics & spawn tuning (slower & fewer)
 const GRAVITY = 1200; // px/s^2
@@ -335,6 +349,12 @@ const runnerControlModule = (function(){
     // clamp
     if (avatar.y < 20) { avatar.y = 20; avatar.vy = 0; }
     if (avatar.y > height - 20) { avatar.y = height - 20; avatar.vy = 0; }
+
+    // Expose avatar position for peer rendering
+    try {
+      if (!window.__handNinja) window.__handNinja = {};
+      window.__handNinja._runnerAvatar = { x: avatar.x, y: avatar.y };
+    } catch(e) {}
 
     // spawn obstacles
     const now = performance.now();
@@ -874,8 +894,8 @@ window.__handNinja.musicController = (function() {
   let _startCounter = 0;
 
   function isAllowedToPlay() {
-    // Allowed when not in a room (solo) OR when client is admin.
-    return !_inRoom || _isAdmin;
+    // Allowed when not in a room (solo) OR when in a room (all clients can play admin's music).
+    return !_inRoom || _inRoom;
   }
 
   function setRoomState({ inRoom, isAdmin }) {
@@ -4054,12 +4074,13 @@ function drawPeerGhosts() {
         // - paint_only: do not draw hands (paints drawn elsewhere), draw name near last paint if available
         // - ball_only: draw a small avatar/ball at primary tip (no name)
         // - ball_name: draw the ball and the name
+        // - avatar_ball: draw the game avatar/ball instead of finger/hand
         const visibilityMap = {
           'ninja-fruit': 'hands_name',
           'shape-trace': 'hands_name',
           'paint-air': 'paint_only',
-          'maze-mini': 'ball_only',
-          'runner-control': 'ball_name',
+          'maze-mini': 'avatar_ball',
+          'runner-control': 'avatar_ball',
           'follow-dot': 'ball_name'
         };
         const mode = visibilityMap[currentGameId] || 'hands_name';
@@ -4139,8 +4160,26 @@ function drawPeerGhosts() {
 
         // For ball modes, draw a small circular avatar at the primary tip.
         // If no primary tip is available, fall through to draw the full skeleton so peers remain visible.
-        if (mode === 'ball_only' || mode === 'ball_name') {
-          const pt = getPrimaryPoint(st.displayHands);
+        if (mode === 'ball_only' || mode === 'ball_name' || mode === 'avatar_ball') {
+          let pt = getPrimaryPoint(st.displayHands);
+
+          // For avatar_ball mode, try to get the game avatar position instead of finger
+          if (mode === 'avatar_ball') {
+            if (currentGameId === 'maze-mini' && window.__handNinja && window.__handNinja._mazePlayer) {
+              // Use maze player position
+              const mazePlayer = window.__handNinja._mazePlayer;
+              if (mazePlayer && typeof mazePlayer.x === 'number' && typeof mazePlayer.y === 'number') {
+                pt = { x: mazePlayer.x, y: mazePlayer.y };
+              }
+            } else if (currentGameId === 'runner-control' && window.__handNinja && window.__handNinja._runnerAvatar) {
+              // Use runner avatar position
+              const runnerAvatar = window.__handNinja._runnerAvatar;
+              if (runnerAvatar && typeof runnerAvatar.x === 'number' && typeof runnerAvatar.y === 'number') {
+                pt = { x: runnerAvatar.x, y: runnerAvatar.y };
+              }
+            }
+          }
+
           if (pt && typeof pt.x === 'number') {
             ctx.save();
             ctx.globalAlpha = fadeFactor;
@@ -4338,8 +4377,31 @@ function onResults(results) {
   // draw video
   drawVideoFrame(results.image);
 
-  // update spawn timers + objects only for ninja-fruit mode
-  if (currentGameId === 'ninja-fruit') {
+  // Handle object spawning and physics for multiplayer games
+  if (isMultiplayerGame && serverGameState && serverGameState.objects) {
+    // In multiplayer mode, use server-provided objects
+    // Update existing objects from server state
+    for (const serverObj of serverGameState.objects) {
+      const localObj = objects.find(o => o.id === serverObj.id);
+      if (!localObj && !serverObj.sliced) {
+        // Add new server object to local rendering
+        objects.push({
+          ...serverObj,
+          sliced: false
+        });
+      } else if (localObj && serverObj.sliced && !localObj.sliced) {
+        // Mark local object as sliced if server says it is
+        localObj.sliced = true;
+      }
+    }
+
+    // Remove objects that are no longer in server state
+    objects = objects.filter(obj => {
+      const serverObj = serverGameState.objects.find(s => s.id === obj.id);
+      return serverObj && !serverObj.sliced;
+    });
+  } else if (currentGameId === 'ninja-fruit') {
+    // Single-player mode: spawn objects locally
     if (running) {
       if (now - lastFruitSpawn > FRUIT_SPAWN_INTERVAL) {
         lastFruitSpawn = now;
@@ -4351,11 +4413,14 @@ function onResults(results) {
         if (Math.random() < 0.6) spawnBomb();
       }
     }
-    // update objects physics & draw
-    drawObjects(dt);
   } else {
     // Non-fruit modes should not show ninja objects; clear any leftover objects.
     if (objects.length) objects.length = 0;
+  }
+
+  // Always update and draw objects if they exist
+  if (objects.length > 0) {
+    drawObjects(dt);
   }
 
   // map landmarks and draw hand trails and collision detection
@@ -5104,6 +5169,19 @@ drawPeerGhosts();
           const obj = objects[i];
           if (obj.sliced) continue;
           if (sliceSegmentIntersectsFruit(p.x,p.y,q.x,q.y,obj)) {
+            // Send object hit to server for synchronization
+            if (isMultiplayerGame && window.NET && typeof window.NET.sendObjectHit === 'function') {
+              try {
+                window.NET.sendObjectHit({
+                  objectId: obj.id,
+                  hitType: obj.type === 'bomb' ? 'bomb' : 'slice',
+                  points: obj.type === 'bomb' ? -20 : 10
+                });
+              } catch (e) {
+                console.warn('Failed to send object hit to server:', e);
+              }
+            }
+
             handleHit(obj, { x: (p.x+q.x)/2, y: (p.y+q.y)/2 });
           }
         }
@@ -5849,6 +5927,26 @@ function updateGameBGM(newGameId, { force = false } = {}) {
   } catch(e){ console.warn('updateGameBGM failed', e); }
 }
 
+// Enhanced audio unlock for room scenarios
+function ensureAudioUnlocked() {
+  try {
+    // Resume AudioContext if suspended
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(()=>{});
+    }
+    
+    // Unlock SimpleAudio if needed
+    if (window.__handNinja && window.__handNinja._simpleAudio && !window.__handNinja._simpleAudio.unlocked) {
+      try {
+        window.__handNinja._simpleAudio.initOnFirstInteraction();
+      } catch(e){}
+    }
+    
+    // Set user interacted flag
+    window.__handNinja._userInteracted = true;
+  } catch(e){}
+}
+
 // Enhanced game selector with centralized BGM control
 if (gameSel) {
   gameSel.addEventListener('change', (e) => {
@@ -5987,16 +6085,24 @@ if (window.NET) {
     NET.on('game_begin', (data) => {
       try {
         console.log('Received server game_begin:', data);
-        
+
         // mark begun and clear fallback timer
         try { if (window.__handNinja) window.__handNinja._gameBegun = true; } catch(e){}
         try { if (window.__handNinja && window.__handNinja._gameStartFallbackTimeout) { clearTimeout(window.__handNinja._gameStartFallbackTimeout); window.__handNinja._gameStartFallbackTimeout = null; } } catch(e){}
 
-        // Extract startTime and seed
+        // Extract startTime, seed, and gameState
         const startEpoch = (data && data.startTime) ? Number(data.startTime) : Date.now();
         const seed = (typeof data.seed === 'number') ? Number(data.seed) : (data && data.seed ? Number(String(data.seed).split('').reduce((s,c)=>s + c.charCodeAt(0),0)) : Date.now());
+        const serverGameState = data && data.gameState ? data.gameState : null;
 
-        console.log(`Server game_begin - startEpoch: ${startEpoch}, seed: ${seed}, currentGame: ${currentGameId}`);
+        console.log(`Server game_begin - startEpoch: ${startEpoch}, seed: ${seed}, currentGame: ${currentGameId}, hasGameState: ${!!serverGameState}`);
+
+        // Store server game state and mark as multiplayer
+        if (serverGameState) {
+          serverGameState = serverGameState;
+          isMultiplayerGame = true;
+          localPlayerId = NET.socket && NET.socket.id ? NET.socket.id : null;
+        }
 
         // Seed deterministic RNG to ensure synchronized spawn/maze generation
         try { seedRng(seed); } catch(e){ console.warn('seedRng failed', e); }
@@ -6012,7 +6118,7 @@ if (window.NET) {
         const initializeGameState = () => {
           try {
             console.log(`Initializing synchronized game state for ${currentGameId}`);
-            
+
             // Only clear to black when the camera/video is not producing frames yet.
             // Clearing unconditionally can produce a visible black screen while the camera warms up.
             try {
@@ -6021,44 +6127,71 @@ if (window.NET) {
                 ctx.fillRect(0, 0, canvas.width / DPR, canvas.height / DPR);
               }
             } catch (e) { /* ignore canvas clear failures */ }
-            
+
             // Reset all state
             score = 0;
             objects.length = 0;
             particles.length = 0;
             popups.length = 0;
-            
+
             // Clear mode-specific state
             if (paintPaths) paintPaths.length = 0;
             if (shapes) shapes.length = 0;
             if (shapeCovered) shapeCovered.length = 0;
-            
+
+            // Use server-provided game state if available
+            if (serverGameState && serverGameState.objects) {
+              // Load server-generated objects
+              objects.push(...serverGameState.objects.map(obj => ({
+                ...obj,
+                sliced: false // Reset sliced state for local interaction
+              })));
+
+              console.log(`Loaded ${serverGameState.objects.length} objects from server`);
+            }
+
             // Mode-specific initialization with seed
             if (currentGameId === 'runner-control') {
               runnerControlModule.onStart && runnerControlModule.onStart();
             } else if (currentGameId === 'maze-mini') {
               mazeModule.onStart && mazeModule.onStart();
             } else if (currentGameId === 'shape-trace') {
-              const s = generateRandomShape();
-              shapes = [s];
-              shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
-              window.__handNinja._shapeCoveredCount = 0;
-              shapeIndex = 0;
-              shapeProgress = 0;
+              if (serverGameState && serverGameState.shape) {
+                // Use server-provided shape
+                shapes = [{
+                  type: serverGameState.shape.type,
+                  points: serverGameState.shape.points
+                }];
+                shapeCovered = new Array(Math.max(0, serverGameState.shape.points.length - 1)).fill(false);
+                window.__handNinja._shapeCoveredCount = 0;
+                shapeIndex = 0;
+                shapeProgress = 0;
+                console.log(`Loaded server shape: ${serverGameState.shape.type}`);
+              } else {
+                const s = generateRandomShape();
+                shapes = [s];
+                shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
+                window.__handNinja._shapeCoveredCount = 0;
+                shapeIndex = 0;
+                shapeProgress = 0;
+              }
             } else if (currentGameId === 'paint-air') {
               paintPaths.length = 0;
               paintTrack.length = 0;
               paintOnTrackLen = 0;
               paintModeNoTimer = true;
               showPaintToolbar(true);
+            } else if (currentGameId === 'maze-mini' && serverGameState && serverGameState.maze) {
+              // Use server-provided maze
+              console.log('Using server-provided maze');
             }
-            
+
             // Align local timers and spawn anchors
             startTime = performance.now();
             lastFrameTime = performance.now();
             lastFruitSpawn = startTime;
             lastBombSpawn = startTime;
-            
+
             // Start BGM per music controller policy (admin vs non-admin / server-forced)
             try {
               const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
@@ -6070,10 +6203,10 @@ if (window.NET) {
                 }
               }
             } catch (e) { console.warn('BGM start on game_begin failed', e); }
-            
+
             running = true;
             menuEl.style.display = 'none';
-            
+
             // Set appropriate start message
             if (currentGameId === 'ninja-fruit') {
               noticeEl.textContent = 'Multiplayer game started — slice fruits, avoid bombs!';
@@ -6088,10 +6221,10 @@ if (window.NET) {
             } else {
               noticeEl.textContent = 'Multiplayer game started!';
             }
-            
+
             console.log(`Game state initialized successfully for ${currentGameId}`);
-            
-          } catch(e) { 
+
+          } catch(e) {
             console.error('Game state initialization failed:', e);
             noticeEl.textContent = 'Game initialization failed - check console';
           }
@@ -6105,6 +6238,66 @@ if (window.NET) {
           initializeGameState();
         }
       } catch (e) { console.error('game_begin handler failed:', e); }
+    });
+
+    // Handle score updates from server
+    NET.on('score_update', (data) => {
+      try {
+        if (!data) return;
+        roomScores = data.scores || {};
+
+        // Update local score display if it's our score
+        if (localPlayerId && data.playerId === localPlayerId) {
+          score = data.score || 0;
+          updateUI();
+        }
+
+        console.log('Score update:', data);
+      } catch (e) {
+        console.warn('score_update handler failed:', e);
+      }
+    });
+
+    // Handle object hit notifications from server
+    NET.on('object_hit', (data) => {
+      try {
+        if (!data) return;
+
+        const { objectId, hitType, points, playerId, playerName, scores } = data;
+
+        // Update room scores
+        roomScores = scores || {};
+
+        // Find and mark the object as sliced locally
+        const obj = objects.find(o => o.id === objectId);
+        if (obj && !obj.sliced) {
+          obj.sliced = true;
+          obj.slicedBy = playerId;
+          obj.slicedAt = Date.now();
+
+          // Show hit effects
+          const fx = obj.x, fy = obj.y;
+          if (obj.type === 'bomb') {
+            spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 18);
+            spawnPopup(fx, fy, `-${points} (${playerName})`, { col: 'rgba(255,80,80,0.95)', size: 16 });
+            playSound('bomb');
+          } else {
+            spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 12);
+            spawnPopup(fx, fy, `+${points} (${playerName})`, { col: 'rgba(255,240,200,1)', size: 16 });
+            playSound('slice');
+          }
+
+          // Remove object after delay
+          setTimeout(() => {
+            const idx = objects.findIndex(o => o.id === objectId);
+            if (idx !== -1) objects.splice(idx, 1);
+          }, 80);
+        }
+
+        console.log('Object hit:', data);
+      } catch (e) {
+        console.warn('object_hit handler failed:', e);
+      }
     });
 
     // Optional: update local UI when room metadata changes

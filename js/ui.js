@@ -472,6 +472,17 @@ Purpose:
       } catch (e) { console.warn('Failed to sync room state on game_end', e); }
     });
 
+    // Handle being kicked from a room
+    NET.on('kicked', (data) => {
+      try {
+        alert(`You have been kicked from room ${data.room || ''} by the admin.`);
+        STATE.room = null;
+        STATE.peers = [];
+        STATE.isAdmin = false;
+        updateRoomUI();
+      } catch (e) { console.warn('kicked handler failed', e); }
+    });
+
     // UI helpers for room-specific rendering
     function ensureRoomInfoEl() {
       let info = body.querySelector('.rooms-room-info');

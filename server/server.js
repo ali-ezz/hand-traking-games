@@ -85,11 +85,203 @@ app.post('/leaderboard', (req, res) => {
 
 // In-memory room manager and state caches
 const rooms = Object.create(null);
-// rooms[roomId] = { id, public, players: Map(socketId->meta), createdAt, cleanupTimer, admin, game, status, timeLimit, startTs, endTs }
+// rooms[roomId] = { id, public, players: Map(socketId->meta), createdAt, cleanupTimer, admin, game, status, timeLimit, startTs, endTs, gameState, scores }
 
 // Keep last-known state per socket to let newcomers see peers immediately
 const lastHandBySocket = new Map(); // socketId -> { payload, name, ts }
 const lastPaintBySocket = new Map(); // socketId -> { payload, name, ts }
+
+// Game state generation utilities
+function generateGameState(gameId, seed) {
+  // Use deterministic RNG for reproducible game state
+  const rng = mulberry32(seed);
+
+  const gameState = {
+    seed: seed,
+    objects: [],
+    spawnPatterns: [],
+    gameId: gameId,
+    generatedAt: Date.now()
+  };
+
+  if (gameId === 'ninja-fruit') {
+    // Generate fruits and bombs with deterministic patterns
+    const fruitCount = 15 + Math.floor(rng() * 10); // 15-25 fruits
+    const bombCount = 3 + Math.floor(rng() * 3); // 3-6 bombs
+
+    // Generate spawn positions deterministically
+    for (let i = 0; i < fruitCount; i++) {
+      const x = 50 + rng() * 700; // Spread across canvas width
+      const y = -50 - rng() * 200; // Start above screen
+      const vx = (rng() - 0.5) * 400; // Random horizontal velocity
+      const vy = 800 + rng() * 600; // Strong upward throw
+      const color = `hsl(${Math.floor(rng() * 360)},70%,55%)`;
+
+      gameState.objects.push({
+        id: `fruit_${i}`,
+        type: 'fruit',
+        x, y, vx, vy,
+        r: 20 + rng() * 14,
+        color,
+        sliced: false
+      });
+    }
+
+    for (let i = 0; i < bombCount; i++) {
+      const x = 50 + rng() * 700;
+      const y = -50 - rng() * 200;
+      const vx = (rng() - 0.5) * 300;
+      const vy = 800 + rng() * 600;
+
+      gameState.objects.push({
+        id: `bomb_${i}`,
+        type: 'bomb',
+        x, y, vx, vy,
+        r: 18 + rng() * 8,
+        color: '#111',
+        sliced: false
+      });
+    }
+
+    // Generate spawn timing patterns
+    gameState.spawnPatterns = {
+      fruitInterval: 1200 + rng() * 800,
+      bombInterval: 4000 + rng() * 2000,
+      maxFruits: 6,
+      maxBombs: 2
+    };
+
+  } else if (gameId === 'shape-trace') {
+    // Generate a deterministic shape for all players
+    const shapes = ['circle', 'triangle', 'square', 'star', 'heart'];
+    const selectedShape = shapes[Math.floor(rng() * shapes.length)];
+
+    gameState.shape = {
+      type: selectedShape,
+      points: generateShapePoints(selectedShape, rng),
+      tolerance: 60 + rng() * 40
+    };
+
+  } else if (gameId === 'maze-mini') {
+    // Generate deterministic maze
+    gameState.maze = generateMaze(rng);
+
+  } else if (gameId === 'runner-control') {
+    // Generate obstacle patterns
+    gameState.obstacles = [];
+    for (let i = 0; i < 20; i++) {
+      gameState.obstacles.push({
+        id: `obs_${i}`,
+        x: 800 + i * 300 + rng() * 200,
+        y: 200 + rng() * 200,
+        width: 32,
+        height: 80 + rng() * 40,
+        speed: 200 + rng() * 50
+      });
+    }
+  }
+
+  return gameState;
+}
+
+function generateShapePoints(type, rng) {
+  const points = [];
+  const centerX = 400;
+  const centerY = 300;
+  const radius = 100 + rng() * 50;
+
+  if (type === 'circle') {
+    const segments = 24;
+    for (let i = 0; i <= segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      points.push({
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius
+      });
+    }
+  } else if (type === 'triangle') {
+    for (let i = 0; i <= 3; i++) {
+      const angle = (i / 3) * Math.PI * 2;
+      points.push({
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius
+      });
+    }
+  } else if (type === 'square') {
+    const size = radius * 0.7;
+    points.push({ x: centerX - size, y: centerY - size });
+    points.push({ x: centerX + size, y: centerY - size });
+    points.push({ x: centerX + size, y: centerY + size });
+    points.push({ x: centerX - size, y: centerY + size });
+    points.push({ x: centerX - size, y: centerY - size }); // close
+  }
+
+  return points;
+}
+
+function generateMaze(rng) {
+  const cols = 8 + Math.floor(rng() * 4); // 8-12 columns
+  const rows = 6 + Math.floor(rng() * 3); // 6-9 rows
+  const cellSize = 60;
+
+  // Simple maze generation using randomized DFS
+  const cells = new Array(cols * rows).fill().map(() => ({
+    walls: [true, true, true, true], // top, right, bottom, left
+    visited: false
+  }));
+
+  const stack = [];
+  const startIdx = Math.floor(rng() * cols);
+  cells[startIdx].visited = true;
+  stack.push(startIdx);
+
+  while (stack.length > 0) {
+    const current = stack[stack.length - 1];
+    const neighbors = [];
+
+    // Check all 4 directions
+    const dirs = [
+      { dir: 0, dx: 0, dy: -1 }, // top
+      { dir: 1, dx: 1, dy: 0 },  // right
+      { dir: 2, dx: 0, dy: 1 },  // bottom
+      { dir: 3, dx: -1, dy: 0 }  // left
+    ];
+
+    for (const { dir, dx, dy } of dirs) {
+      const nx = (current % cols) + dx;
+      const ny = Math.floor(current / cols) + dy;
+      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+        const neighborIdx = ny * cols + nx;
+        if (!cells[neighborIdx].visited) {
+          neighbors.push({ idx: neighborIdx, dir, oppositeDir: (dir + 2) % 4 });
+        }
+      }
+    }
+
+    if (neighbors.length > 0) {
+      const chosen = neighbors[Math.floor(rng() * neighbors.length)];
+      cells[current].walls[chosen.dir] = false;
+      cells[chosen.idx].walls[chosen.oppositeDir] = false;
+      cells[chosen.idx].visited = true;
+      stack.push(chosen.idx);
+    } else {
+      stack.pop();
+    }
+  }
+
+  return { cols, rows, cellSize, cells };
+}
+
+// Mulberry32 PRNG for deterministic game state generation
+function mulberry32(a) {
+  return function() {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 function createRoom({ id, isPublic }) {
   let roomId = id && String(id).trim() ? String(id).trim() : nanoid(ROOM_ID_SIZE);
@@ -374,7 +566,18 @@ io.on('connection', (socket) => {
     const seed = Math.floor(Math.random() * 0x7fffffff);
     room.startTs = startTs;
     room.endTs = room.startTs + (room.timeLimit || 60) * 1000;
-    try { console.log(`room:${roomId} starting game`, { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, requestedBy: socket.id }); } catch(e){}
+
+    // Generate deterministic game state for all clients
+    const gameState = generateGameState(room.game, seed);
+    room.gameState = gameState;
+
+    // Initialize per-player scores
+    room.scores = {};
+    for (const [playerId, playerMeta] of room.players.entries()) {
+      room.scores[playerId] = { score: 0, name: playerMeta.name };
+    }
+
+    try { console.log(`room:${roomId} starting game`, { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, requestedBy: socket.id, objectsCount: gameState.objects ? gameState.objects.length : 0 }); } catch(e){}
 
     // emit updated room metadata and a game_start notification
     io.to(roomId).emit('room_update', {
@@ -392,7 +595,7 @@ io.on('connection', (socket) => {
     const __delay = Math.max(0, room.startTs - Date.now());
     room.beginTimer = setTimeout(() => {
       try {
-        io.to(roomId).emit('game_begin', { startTime: room.startTs, seed });
+        io.to(roomId).emit('game_begin', { startTime: room.startTs, seed, gameState });
       } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
       room.beginTimer = null;
     }, __delay);
@@ -594,11 +797,79 @@ io.on('connection', (socket) => {
         if (cb) cb({ ok: false, reason: 'invalid_score' });
         return;
       }
+
+      // Update room-specific scores if in a room
+      const roomId = socket.data.roomId;
+      if (roomId && rooms[roomId] && rooms[roomId].scores) {
+        rooms[roomId].scores[socket.id] = { score, name: socket.data.displayName || name };
+        // Broadcast score update to all room members
+        io.to(roomId).emit('score_update', {
+          playerId: socket.id,
+          score,
+          name: socket.data.displayName || name,
+          scores: rooms[roomId].scores
+        });
+      }
+
       const updated = postLeader(game, { name, score });
       if (cb) cb({ ok: true, leaders: updated });
       io.emit('leaderboard_update', { game, leaders: updated });
     } catch (err) {
       console.error('score handler err', err);
+      if (cb) cb({ ok: false, reason: 'error' });
+    }
+  });
+
+  // Handle object slicing/hit events for synchronization
+  socket.on('object_hit', (payload, cb) => {
+    try {
+      const roomId = socket.data.roomId;
+      if (!roomId || !rooms[roomId]) {
+        if (cb) cb({ ok: false, reason: 'not_in_room' });
+        return;
+      }
+
+      const room = rooms[roomId];
+      if (!room.gameState || !room.gameState.objects) {
+        if (cb) cb({ ok: false, reason: 'no_game_state' });
+        return;
+      }
+
+      const { objectId, hitType = 'slice', points = 10 } = payload || {};
+      if (!objectId) {
+        if (cb) cb({ ok: false, reason: 'missing_object_id' });
+        return;
+      }
+
+      // Find and mark object as sliced
+      const obj = room.gameState.objects.find(o => o.id === objectId);
+      if (obj && !obj.sliced) {
+        obj.sliced = true;
+        obj.slicedBy = socket.id;
+        obj.slicedAt = Date.now();
+
+        // Update player score
+        if (!room.scores[socket.id]) {
+          room.scores[socket.id] = { score: 0, name: socket.data.displayName || 'Player' };
+        }
+        room.scores[socket.id].score += points;
+
+        // Broadcast the hit to all clients
+        io.to(roomId).emit('object_hit', {
+          objectId,
+          hitType,
+          points,
+          playerId: socket.id,
+          playerName: socket.data.displayName || 'Player',
+          scores: room.scores
+        });
+
+        if (cb) cb({ ok: true, score: room.scores[socket.id].score });
+      } else {
+        if (cb) cb({ ok: false, reason: 'object_already_sliced' });
+      }
+    } catch (err) {
+      console.error('object_hit handler err', err);
       if (cb) cb({ ok: false, reason: 'error' });
     }
   });
