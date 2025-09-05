@@ -2393,13 +2393,13 @@ function playFatSound(soundName, options = {}) {
 
 function setMusicEnabled(v) {
   // Debounced, consolidated music toggle to avoid rapid stop/start thrash.
-  // Keeps a single authoritative implementation so duplicate definitions don't conflict.
+  // Keep a single authoritative implementation and avoid local-start when joined to a room
+  // where the admin controls the BGM.
   try {
     const wasEnabled = !!musicEnabled;
     musicEnabled = !!v;
     console.log(`Music toggled: wasEnabled=${wasEnabled}, nowEnabled=${musicEnabled}`);
   } catch (e) {
-    // defensive: ensure musicEnabled boolean exists
     musicEnabled = !!v;
   }
 
@@ -2409,22 +2409,33 @@ function setMusicEnabled(v) {
     if (setMusicEnabled._debounceTimer) clearTimeout(setMusicEnabled._debounceTimer);
     setMusicEnabled._debounceTimer = setTimeout(() => {
       try {
-        // Always stop everything first to ensure a clean state before starting new BGM.
+        // Always stop everything first to ensure a clean state before applying change.
         try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
 
-        if (setMusicEnabled._pending) {
-          // Ensure AudioContext exists / resumed before attempting to play BGM.
-          try { ensureAudioCtx(); } catch (e) { /* ignore */ }
+        const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
 
-          // Small safety delay to allow audio tear-down to complete in some browsers.
-          setTimeout(() => {
-            try {
-              playSound('bgm');
-            } catch (err) {
-              console.warn('Failed to start BGM after enabling music', err);
-            }
-          }, 120);
+        if (setMusicEnabled._pending) {
+          // If the client is inside a room and is NOT the admin, do NOT start local BGM.
+          // The room admin's selection (server-driven) is authoritative and will force playback
+          // for all clients via room_update/game_start handlers.
+          if (roomsState && roomsState.room && !roomsState.isAdmin) {
+            console.log('Music enabled locally but waiting for room admin to pick/start BGM');
+            // Do not auto-start; keep the desired state set so when server forces BGM it will play.
+          } else {
+            // Not in a room or is admin: safe to start local BGM.
+            try { ensureAudioCtx(); } catch (e) { /* ignore */ }
+
+            // Small safety delay to allow audio tear-down to complete in some browsers.
+            setTimeout(() => {
+              try {
+                playSound('bgm');
+              } catch (err) {
+                console.warn('Failed to start BGM after enabling music', err);
+              }
+            }, 120);
+          }
         } else {
+          // Disabled: ensure everything is stopped immediately.
           console.log('Music disabled - all audio stopped');
         }
       } catch (e) {
@@ -2440,7 +2451,13 @@ function setMusicEnabled(v) {
     try { stopAllAudio(); } catch(e){}
     if (musicEnabled) {
       try { ensureAudioCtx(); } catch(e){}
-      try { playSound('bgm'); } catch(e){}
+      // Only start if not in a room or is admin (best-effort)
+      const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+      if (!roomsState || !roomsState.room || roomsState.isAdmin) {
+        try { playSound('bgm'); } catch(e){}
+      } else {
+        console.log('Music enabled but in-room non-admin; waiting for admin to start BGM');
+      }
     }
   }
 }
