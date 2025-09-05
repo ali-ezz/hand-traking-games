@@ -2393,8 +2393,6 @@ function playFatSound(soundName, options = {}) {
 
 function setMusicEnabled(v) {
   // Debounced, consolidated music toggle to avoid rapid stop/start thrash.
-  // Keep a single authoritative implementation and avoid local-start when joined to a room
-  // where the admin controls the BGM.
   try {
     const wasEnabled = !!musicEnabled;
     musicEnabled = !!v;
@@ -2403,24 +2401,59 @@ function setMusicEnabled(v) {
     musicEnabled = !!v;
   }
 
+  // immediate UI feedback for room users (non-blocking)
+  try {
+    const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+    if (roomsState && roomsState.room && !roomsState.isAdmin && musicEnabled) {
+      try {
+        if (noticeEl) {
+          noticeEl.textContent = 'Music preference saved — waiting for room admin to start BGM';
+          setTimeout(() => { try { noticeEl.textContent = ''; } catch (e) {} }, 2200);
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+
   // Store desired state and debounce applying it to avoid quick toggles causing audio artifacts.
   try {
     setMusicEnabled._pending = !!musicEnabled;
     if (setMusicEnabled._debounceTimer) clearTimeout(setMusicEnabled._debounceTimer);
     setMusicEnabled._debounceTimer = setTimeout(() => {
       try {
-        // Always stop everything first to ensure a clean state before applying change.
-        try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
+        // Always stop everything first to ensure a clean state before applying change
+        // when it's safe to do so (solo or admin).
+        try {
+          const roomsStateInner = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+          const inRoom = roomsStateInner && roomsStateInner.room;
+          const isAdmin = roomsStateInner && roomsStateInner.isAdmin;
+          // Non-admins in a room should not teardown/start audio when toggling; preserve admin/solo behavior.
+          if (!inRoom || isAdmin) {
+            try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
+          } else {
+            // For non-admin room users, just record preference and give feedback.
+            if (!setMusicEnabled._pending) {
+              // if user explicitly disabled while in-room, stop what they can locally
+              try { stopAllAudio(); } catch (e) {}
+            }
+          }
+        } catch (innerE) {
+          try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
+        }
 
         const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
 
         if (setMusicEnabled._pending) {
           // If the client is inside a room and is NOT the admin, do NOT start local BGM.
           // The room admin's selection (server-driven) is authoritative and will force playback
-          // for all clients via room_update/game_start handlers.
+          // for all clients via game_begin handlers. Provide visible feedback instead.
           if (roomsState && roomsState.room && !roomsState.isAdmin) {
             console.log('Music enabled locally but waiting for room admin to pick/start BGM');
-            // Do not auto-start; keep the desired state set so when server forces BGM it will play.
+            try {
+              if (noticeEl) {
+                noticeEl.textContent = 'Music preference saved — waiting for room admin';
+                setTimeout(() => { try { noticeEl.textContent = ''; } catch (e) {} }, 1800);
+              }
+            } catch (e) {}
           } else {
             // Not in a room or is admin: safe to start local BGM.
             try { ensureAudioCtx(); } catch (e) { /* ignore */ }
@@ -2437,6 +2470,7 @@ function setMusicEnabled(v) {
         } else {
           // Disabled: ensure everything is stopped immediately.
           console.log('Music disabled - all audio stopped');
+          try { if (noticeEl) { noticeEl.textContent = 'Music disabled'; setTimeout(()=>{ try{ noticeEl.textContent=''; }catch(e){} }, 1200); } } catch(e){}
         }
       } catch (e) {
         console.warn('setMusicEnabled apply failed', e);
@@ -5578,22 +5612,24 @@ function stopAllAudio() {
   console.log('All audio sources stopped');
 }
 
- // Centralized BGM system - only update BGM when not in a room or when admin
- // now supports a force flag so server-initiated updates (game_start) can override admin checks
+ // Centralized BGM system - safer behavior around rooms and joins
 function updateGameBGM(newGameId, { force = false } = {}) {
-  // Check if we're in a room and not admin (unless forced by server)
   const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-  if (roomsState && roomsState.room && !roomsState.isAdmin && !force) {
-    console.log('Not admin - BGM controlled by room admin (no force)');
-    return; // Non-admin users don't control BGM in rooms unless forced
-  }
-  
+  const inRoom = roomsState && roomsState.room;
+  const isAdmin = roomsState && roomsState.isAdmin;
   console.log(`Updating BGM for game: ${newGameId} (force=${!!force})`);
-  
-  // Always stop all audio first to prevent overlap
-  stopAllAudio();
-  
-  // Set up per-game assets and update ASSETS.bgm
+
+  // Decide whether we should teardown current playback.
+  // Teardown/start only when solo, when we're the admin, or when explicitly forced.
+  const shouldTeardown = (!inRoom) || isAdmin || !!force;
+
+  if (shouldTeardown) {
+    try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed in updateGameBGM', e); }
+  } else {
+    console.log('In-room non-admin — updating BGM asset mapping only (no teardown/start)');
+  }
+
+  // Map game id to asset URL
   let newBgm = null;
   if (newGameId === 'ninja-fruit') {
     newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
@@ -5606,39 +5642,47 @@ function updateGameBGM(newGameId, { force = false } = {}) {
   } else if (newGameId === 'maze-mini') {
     newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3';
   } else {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3'; // fallback
+    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
   }
-  
+
   ASSETS.bgm = newBgm;
-  console.log(`BGM set to: ${newBgm} for game: ${newGameId}`);
-  
-  // Update SimpleAudio mapping
+  console.log(`BGM asset updated to: ${newBgm} for game: ${newGameId}`);
+
+  // Update SimpleAudio mapping (do not forcibly play)
   if (window.__handNinja && window.__handNinja._simpleAudio) {
     window.__handNinja._simpleAudio.map.bgm = newBgm;
-    // Clear cached BGM
-    if (window.__handNinja._simpleAudio.buff && window.__handNinja._simpleAudio.buff.bgm) {
+    if (shouldTeardown && window.__handNinja._simpleAudio.buff && window.__handNinja._simpleAudio.buff.bgm) {
       delete window.__handNinja._simpleAudio.buff.bgm;
     }
     window.__handNinja._simpleAudio.bgm = null;
     window.__handNinja._simpleAudio.bgmKey = null;
   }
-  
-  // Clear all cached audio
-  if (soundPool && soundPool.bgm) delete soundPool.bgm;
-  if (sfxBuffers && sfxBuffers['bgm']) delete sfxBuffers['bgm'];
-  decodedBgm = null;
-  decodedBgmUrl = null;
-  decodedBgmPlaying = false;
-  
-  // Restart music if enabled AND (not in a room OR admin) OR force is true
-  if (musicEnabled && ((!roomsState || !roomsState.room || roomsState.isAdmin) || force)) {
-    console.log('Starting new BGM due to update (admin/solo/forced)');
+
+  // Clear local caches when we performed teardown
+  if (shouldTeardown) {
+    try { if (soundPool && soundPool.bgm) delete soundPool.bgm; } catch(e){}
+    try { if (sfxBuffers && sfxBuffers['bgm']) delete sfxBuffers['bgm']; } catch(e){}
+    decodedBgm = null;
+    decodedBgmUrl = null;
+    decodedBgmPlaying = false;
+  } else {
+    // Non-admin in-room: attempt to preload the asset in background but don't interrupt playback
+    try {
+      (async () => {
+        try {
+          await preloadAssets().catch(()=>{});
+          await ensureDecodedSfxAll().catch(()=>{});
+          if (ASSETS && ASSETS.bgm) await decodeBgmBuffer(ASSETS.bgm).catch(()=>{});
+        } catch(e) {}
+      })();
+    } catch(e){}
+  }
+
+  // Only start music automatically if we actually tore down (solo/admin/forced) and user allows music.
+  if (musicEnabled && shouldTeardown) {
+    console.log('Starting new BGM due to update (solo/admin/forced)');
     setTimeout(() => {
-      try {
-        playSound('bgm');
-      } catch(e) {
-        console.warn('Failed to start new BGM:', e);
-      }
+      try { playSound('bgm'); } catch(e){ console.warn('Failed to start new BGM:', e); }
     }, 250);
   }
 }
@@ -5699,20 +5743,20 @@ if (window.NET) {
   try {
     // server-driven game start: request readiness, preload, then wait for authoritative begin
     NET.on('game_start', (data) => {
-      try {
-        // honor server-selected game and timeLimit in the UI
-        if (data && data.game) {
-          const sel = document.getElementById('gameSelect');
-          if (sel) sel.value = data.game;
-          // Make the server's game selection authoritative locally so subsequent logic uses it
-          try { currentGameId = data.game; } catch (e) { /* ignore if not writable */ }
-          // Best-effort: update background music to match admin-selected game (force so admin selection applies to all clients)
-          try { if (typeof updateGameBGM === 'function') updateGameBGM(data.game, { force: true }); } catch (e) { console.warn('updateGameBGM failed on game_start', e); }
-        }
-        if (data && typeof data.timeLimit === 'number') {
-          const gl = document.getElementById('gameLength');
-          if (gl) gl.value = data.timeLimit;
-        }
+        try {
+          // honor server-selected game and timeLimit in the UI
+          if (data && data.game) {
+            const sel = document.getElementById('gameSelect');
+            if (sel) sel.value = data.game;
+            // Make the server's game selection authoritative locally so subsequent logic uses it
+            try { currentGameId = data.game; } catch (e) { /* ignore if not writable */ }
+            // Best-effort: update background music asset to match admin-selected game (do not force playback here)
+            try { if (typeof updateGameBGM === 'function') updateGameBGM(data.game, { force: false }); } catch (e) { console.warn('updateGameBGM failed on game_start', e); }
+          }
+          if (data && typeof data.timeLimit === 'number') {
+            const gl = document.getElementById('gameLength');
+            if (gl) gl.value = data.timeLimit;
+          }
 
         // Show "waiting" overlay while we preload and warm camera/audio
         showWaitingForPlayersOverlay(true, 'Preparing your client — loading assets and hand tracking');
@@ -5905,8 +5949,8 @@ if (window.NET) {
         const gl = document.getElementById('gameLength');
         if (gl && typeof data.timeLimit === 'number') gl.value = data.timeLimit;
 
-        // Apply admin-selected game BGM for all clients (force) so music/state stays consistent
-        try { if (typeof updateGameBGM === 'function' && data && data.game) updateGameBGM(data.game, { force: true }); } catch (e) { console.warn('updateGameBGM failed on room_update', e); }
+        // Apply admin-selected game BGM for all clients — update asset mapping but do not force playback here
+        try { if (typeof updateGameBGM === 'function' && data && data.game) updateGameBGM(data.game, { force: false }); } catch (e) { console.warn('updateGameBGM failed on room_update', e); }
 
         // show a short notice when admin changes options
         if (typeof noticeEl !== 'undefined' && noticeEl) {
