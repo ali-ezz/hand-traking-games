@@ -175,7 +175,6 @@ function leaveRoom(socket) {
       admin: room.admin,
       game: room.game,
       timeLimit: room.timeLimit,
-      musicEnabled: !!room.musicEnabled,
       status: room.status,
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
@@ -249,7 +248,6 @@ io.on('connection', (socket) => {
       admin: room.admin,
       game: room.game,
       timeLimit: room.timeLimit,
-      musicEnabled: !!room.musicEnabled,
       status: room.status,
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
@@ -295,17 +293,15 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
     if (room.admin !== socket.id) { if (cb) cb({ ok: false, reason: 'not_admin' }); return; }
-    const { game, timeLimit, musicEnabled } = opts;
+    const { game, timeLimit } = opts;
     if (typeof game === 'string') room.game = game;
     if (typeof timeLimit === 'number') room.timeLimit = Math.max(5, Math.min(3600, Math.floor(timeLimit)));
-    if (typeof musicEnabled === 'boolean') room.musicEnabled = !!musicEnabled;
     io.to(roomId).emit('room_update', {
       id: room.id,
       public: room.public,
       admin: room.admin,
       game: room.game,
       timeLimit: room.timeLimit,
-      musicEnabled: !!room.musicEnabled,
       status: room.status,
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
@@ -325,99 +321,20 @@ io.on('connection', (socket) => {
     const seed = Math.floor(Math.random() * 0x7fffffff);
     room.startTs = startTs;
     room.endTs = room.startTs + (room.timeLimit || 60) * 1000;
-
-    // clear any existing end timer so we don't double-schedule
-    if (room._endTimer) {
-      try { clearTimeout(room._endTimer); } catch (e) {}
-      room._endTimer = null;
-    }
-
     io.to(roomId).emit('room_update', {
       id: room.id,
       public: room.public,
       admin: room.admin,
       game: room.game,
       timeLimit: room.timeLimit,
-      musicEnabled: !!room.musicEnabled,
       status: room.status,
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
-    // Include authoritative musicEnabled and admin info with game lifecycle events so clients
-    // can apply the room-admin choices (BGM on/off and selected game) immediately and consistently.
-    io.to(roomId).emit('game_start', {
-      game: room.game,
-      timeLimit: room.timeLimit,
-      startTs: room.startTs,
-      endTs: room.endTs,
-      seed,
-      musicEnabled: !!room.musicEnabled,
-      admin: room.admin
-    });
+    io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed });
     const __delay = Math.max(0, room.startTs - Date.now());
     setTimeout(() => {
-      try {
-        io.to(roomId).emit('game_begin', {
-          startTime: room.startTs,
-          seed,
-          musicEnabled: !!room.musicEnabled,
-          admin: room.admin
-        });
-      } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
+      try { io.to(roomId).emit('game_begin', { startTime: room.startTs, seed }); } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
     }, __delay);
-
-    // schedule automatic end
-    const __timeUntilEnd = Math.max(0, room.endTs - Date.now());
-    room._endTimer = setTimeout(() => {
-      try {
-        room.status = 'finished';
-      } catch(e){}
-      try { io.to(roomId).emit('game_end', { reason: 'timeout', endTs: room.endTs }); } catch(e){}
-      try {
-        io.to(roomId).emit('room_update', {
-          id: room.id,
-          public: room.public,
-          admin: room.admin,
-          game: room.game,
-          timeLimit: room.timeLimit,
-          musicEnabled: !!room.musicEnabled,
-          status: room.status,
-          players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
-        });
-      } catch(e){}
-      room._endTimer = null;
-    }, __timeUntilEnd);
-
-    if (cb) cb({ ok: true });
-  });
-
-  // allow admin to stop an in-progress room game immediately
-  socket.on('stop_room_game', (opts = {}, cb) => {
-    const roomId = socket.data.roomId;
-    if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
-    const room = rooms[roomId];
-    if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
-    if (room.admin !== socket.id) { if (cb) cb({ ok: false, reason: 'not_admin' }); return; }
-    if (room.status !== 'running') { if (cb) cb({ ok: false, reason: 'not_running' }); return; }
-    // clear any scheduled end timer
-    if (room._endTimer) {
-      try { clearTimeout(room._endTimer); } catch (e) {}
-      room._endTimer = null;
-    }
-    room.status = 'finished';
-    room.endTs = Date.now();
-    try { io.to(roomId).emit('game_end', { reason: 'stopped', endTs: room.endTs }); } catch(e){}
-    try {
-      io.to(roomId).emit('room_update', {
-        id: room.id,
-        public: room.public,
-        admin: room.admin,
-        game: room.game,
-        timeLimit: room.timeLimit,
-        musicEnabled: !!room.musicEnabled,
-        status: room.status,
-        players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
-      });
-    } catch(e){}
     if (cb) cb({ ok: true });
   });
 

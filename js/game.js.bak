@@ -768,31 +768,31 @@ const mazeModule = (function(){
 */
 const ASSETS = (() => {
   const files = [
-    'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bomb-frute.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bomb.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/bomb.wav',
-    'https://ali-ezz.github.io/hand-traking-games/assets/boomb.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_eraser.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_hit.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_jump.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_paint_stroke.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_pop_small.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_popup.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/slice-fruit.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/slice.mp3',
-    'https://ali-ezz.github.io/hand-traking-games/assets/slice.wav'
+    'assets/bgm_maze_loop.mp3',
+    'assets/bgm_paint_loop.mp3',
+    'assets/bgm_runner_loop.mp3',
+    'assets/bgm_shape_loop.mp3',
+    'assets/bgm.mp3',
+    'assets/bomb-frute.mp3',
+    'assets/bomb.mp3',
+    'assets/bomb.wav',
+    'assets/boomb.mp3',
+    'assets/sfx_clear.mp3',
+    'assets/sfx_done.mp3',
+    'assets/sfx_eraser.mp3',
+    'assets/sfx_hit.mp3',
+    'assets/sfx_jump.mp3',
+    'assets/sfx_paint_stroke.mp3',
+    'assets/sfx_point.mp3',
+    'assets/sfx_pop_small.mp3',
+    'assets/sfx_popup.mp3',
+    'assets/sfx_segment_complete.mp3',
+    'assets/sfx_shape_complete.mp3',
+    'assets/sfx_wrong.mp3',
+    'assets/slice-fruit.mp3',
+    'assets/slice-frute.mp3',
+    'assets/slice.mp3',
+    'assets/slice.wav'
   ];
   const has = (p) => files.indexOf(p) !== -1;
   const pick = (candidates) => {
@@ -801,40 +801,40 @@ const ASSETS = (() => {
   };
 
     const sfx = {
-    point: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3']),
+    point: pick(['assets/sfx_point.mp3']),
     popup: null,
-    segment_complete: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3']),
-    shape_complete: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3']),
-    wrong: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3']),
+    segment_complete: pick(['assets/sfx_segment_complete.mp3']),
+    shape_complete: pick(['assets/sfx_shape_complete.mp3']),
+    wrong: pick(['assets/sfx_wrong.mp3']),
     pop_small: null,
-    clear: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3']),
-    done: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3']),
-    eraser: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_eraser.mp3']),
-    hit: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_hit.mp3']),
-    jump: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_jump.mp3']),
-    paint_stroke: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_paint_stroke.mp3']),
+    clear: pick(['assets/sfx_clear.mp3']),
+    done: pick(['assets/sfx_done.mp3']),
+    eraser: pick(['assets/sfx_eraser.mp3']),
+    hit: pick(['assets/sfx_hit.mp3']),
+    jump: pick(['assets/sfx_jump.mp3']),
+    paint_stroke: pick(['assets/sfx_paint_stroke.mp3']),
     // slicing variants (map several possible filenames to the canonical 'slice' key)
     slice: pick([
-      'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/slice-fruit.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/slice.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/slice.wav'
+      'assets/slice-frute.mp3',
+      'assets/slice-fruit.mp3',
+      'assets/slice.mp3',
+      'assets/slice.wav'
     ]),
     // bomb variants
     bomb: pick([
-      'https://ali-ezz.github.io/hand-traking-games/assets/boomb.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/bomb-frute.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/bomb.mp3',
-      'https://ali-ezz.github.io/hand-traking-games/assets/bomb.wav'
+      'assets/boomb.mp3',
+      'assets/bomb-frute.mp3',
+      'assets/bomb.mp3',
+      'assets/bomb.wav'
     ])
   };
 
   const bgmVariants = {
-    paint: pick(['https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3']),
-    shape: pick(['https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3']),
-    runner: pick(['https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3']),
-    maze: pick(['https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3']),
-    default: pick(['https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3'])
+    paint: pick(['assets/bgm_paint_loop.mp3']),
+    shape: pick(['assets/bgm_shape_loop.mp3']),
+    runner: pick(['assets/bgm_runner_loop.mp3']),
+    maze: pick(['assets/bgm_maze_loop.mp3']),
+    default: pick(['assets/bgm.mp3'])
   };
 
   return {
@@ -1161,22 +1161,22 @@ if (!window._SimpleAudio) {
 if (!window.__handNinja) window.__handNinja = {};
 if (!window.__handNinja._simpleAudio) {
   const fallbackMap = {
-    bgm: (ASSETS && ASSETS.bgm) ? ASSETS.bgm : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3',
+    bgm: (ASSETS && ASSETS.bgm) ? ASSETS.bgm : 'assets/bgm.mp3',
     // prefer canonical semantic SFX detected above, fall back to common filenames
-    slice: (ASSETS && ASSETS.sfx && ASSETS.sfx.slice) ? ASSETS.sfx.slice : (ASSETS && ASSETS.slice) ? ASSETS.slice : 'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3',
-    bomb: (ASSETS && ASSETS.sfx && ASSETS.sfx.bomb) ? ASSETS.sfx.bomb : (ASSETS && ASSETS.bomb) ? ASSETS.bomb : 'https://ali-ezz.github.io/hand-traking-games/assets/boomb.mp3',
-    point: (ASSETS && ASSETS.sfx && ASSETS.sfx.point) ? ASSETS.sfx.point : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
+    slice: (ASSETS && ASSETS.sfx && ASSETS.sfx.slice) ? ASSETS.sfx.slice : (ASSETS && ASSETS.slice) ? ASSETS.slice : 'assets/slice-frute.mp3',
+    bomb: (ASSETS && ASSETS.sfx && ASSETS.sfx.bomb) ? ASSETS.sfx.bomb : (ASSETS && ASSETS.bomb) ? ASSETS.bomb : 'assets/boomb.mp3',
+    point: (ASSETS && ASSETS.sfx && ASSETS.sfx.point) ? ASSETS.sfx.point : 'assets/sfx_point.mp3',
     popup: (ASSETS && ASSETS.sfx && ASSETS.sfx.popup) ? ASSETS.sfx.popup : null,
-    segment_complete: (ASSETS && ASSETS.sfx && ASSETS.sfx.segment_complete) ? ASSETS.sfx.segment_complete : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3',
-    shape_complete: (ASSETS && ASSETS.sfx && ASSETS.sfx.shape_complete) ? ASSETS.sfx.shape_complete : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3',
-    wrong: (ASSETS && ASSETS.sfx && ASSETS.sfx.wrong) ? ASSETS.sfx.wrong : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3',
+    segment_complete: (ASSETS && ASSETS.sfx && ASSETS.sfx.segment_complete) ? ASSETS.sfx.segment_complete : 'assets/sfx_segment_complete.mp3',
+    shape_complete: (ASSETS && ASSETS.sfx && ASSETS.sfx.shape_complete) ? ASSETS.sfx.shape_complete : 'assets/sfx_shape_complete.mp3',
+    wrong: (ASSETS && ASSETS.sfx && ASSETS.sfx.wrong) ? ASSETS.sfx.wrong : 'assets/sfx_wrong.mp3',
     pop_small: (ASSETS && ASSETS.sfx && ASSETS.sfx.pop_small) ? ASSETS.sfx.pop_small : null,
-    clear: (ASSETS && ASSETS.sfx && ASSETS.sfx.clear) ? ASSETS.sfx.clear : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3',
-    done: (ASSETS && ASSETS.sfx && ASSETS.sfx.done) ? ASSETS.sfx.done : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3',
-    eraser: (ASSETS && ASSETS.sfx && ASSETS.sfx.eraser) ? ASSETS.sfx.eraser : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_eraser.mp3',
-    paint_stroke: (ASSETS && ASSETS.sfx && ASSETS.sfx.paint_stroke) ? ASSETS.sfx.paint_stroke : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_paint_stroke.mp3',
-    jump: (ASSETS && ASSETS.sfx && ASSETS.sfx.jump) ? ASSETS.sfx.jump : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_jump.mp3',
-    hit: (ASSETS && ASSETS.sfx && ASSETS.sfx.hit) ? ASSETS.sfx.hit : 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_hit.mp3'
+    clear: (ASSETS && ASSETS.sfx && ASSETS.sfx.clear) ? ASSETS.sfx.clear : 'assets/sfx_clear.mp3',
+    done: (ASSETS && ASSETS.sfx && ASSETS.sfx.done) ? ASSETS.sfx.done : 'assets/sfx_done.mp3',
+    eraser: (ASSETS && ASSETS.sfx && ASSETS.sfx.eraser) ? ASSETS.sfx.eraser : 'assets/sfx_eraser.mp3',
+    paint_stroke: (ASSETS && ASSETS.sfx && ASSETS.sfx.paint_stroke) ? ASSETS.sfx.paint_stroke : 'assets/sfx_paint_stroke.mp3',
+    jump: (ASSETS && ASSETS.sfx && ASSETS.sfx.jump) ? ASSETS.sfx.jump : 'assets/sfx_jump.mp3',
+    hit: (ASSETS && ASSETS.sfx && ASSETS.sfx.hit) ? ASSETS.sfx.hit : 'assets/sfx_hit.mp3'
   };
   window.__handNinja._simpleAudio = new window._SimpleAudio(fallbackMap);
   window.__handNinja._simpleAudio.initOnFirstInteraction();
@@ -1546,7 +1546,7 @@ function playSound(name) {
       }
       
       // Get the current game-specific BGM URL
-      const bgmUrl = ASSETS && ASSETS.bgm ? ASSETS.bgm : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
+      const bgmUrl = ASSETS && ASSETS.bgm ? ASSETS.bgm : 'assets/bgm.mp3';
       console.log('Starting BGM:', bgmUrl);
       
       // Try SimpleAudio first for BGM (most reliable)
@@ -1778,8 +1778,8 @@ function playLayeredAudio(soundName, baseVolume = 1.0) {
     const delay = i * 25; // 25ms stagger between layers
     
     setTimeout(() => {
-      // Try to find the asset with 'https://ali-ezz.github.io/hand-traking-games/assets/' prefix
-      const assetPath = layerSound.startsWith('https://ali-ezz.github.io/hand-traking-games/assets/') ? layerSound : `https://ali-ezz.github.io/hand-traking-games/assets/${layerSound}`;
+      // Try to find the asset with 'assets/' prefix
+      const assetPath = layerSound.startsWith('assets/') ? layerSound : `assets/${layerSound}`;
       
       // Check if this specific asset exists in our ASSETS.sfx mapping
       let soundKey = soundName;
@@ -2142,7 +2142,7 @@ class FatResponsiveAudioEngine {
     const { volume = 1.0, pitch = 1.0, position = null } = options;
     
     // Get the full asset path
-    const assetPath = soundFile.startsWith('https://ali-ezz.github.io/hand-traking-games/assets/') ? soundFile : `https://ali-ezz.github.io/hand-traking-games/assets/${soundFile}`;
+    const assetPath = soundFile.startsWith('assets/') ? soundFile : `assets/${soundFile}`;
     
     // Find the sound key in our system
     let soundKey = null;
@@ -4971,68 +4971,68 @@ async function startGame() {
     // prefer per-game mapping to the shipped assets/ filenames
     if (currentGameId === 'ninja-fruit') {
       // use top-level ninja fruit assets present in /assets
-      ASSETS.bgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
+      ASSETS.bgm = 'assets/bgm.mp3';
       // multiple slice variants exist; keep existing best-effort mapping while preserving global sfx map
-      ASSETS.slice = ASSETS.slice || 'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3' || 'https://ali-ezz.github.io/hand-traking-games/assets/slice-fruit.mp3';
-      ASSETS.bomb = ASSETS.bomb || 'https://ali-ezz.github.io/hand-traking-games/assets/boomb.mp3';
+      ASSETS.slice = ASSETS.slice || 'assets/slice-frute.mp3' || 'assets/slice-fruit.mp3';
+      ASSETS.bomb = ASSETS.bomb || 'assets/boomb.mp3';
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        slice: ASSETS.sfx.slice || 'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3',
-        bomb: ASSETS.sfx.bomb || 'https://ali-ezz.github.io/hand-traking-games/assets/boomb.mp3',
-        point: ASSETS.sfx.point || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
+        slice: ASSETS.sfx.slice || 'assets/slice-frute.mp3',
+        bomb: ASSETS.sfx.bomb || 'assets/boomb.mp3',
+        point: ASSETS.sfx.point || 'assets/sfx_point.mp3',
         popup: ASSETS.sfx.popup || null
       });
     } else if (currentGameId === 'paint-air') {
       // paint-air: dedicated paint bgm and SFX from root assets
-      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.paint ? ASSETS.bgmVariants.paint : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3';
+      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.paint ? ASSETS.bgmVariants.paint : 'assets/bgm_paint_loop.mp3';
       ASSETS.slice = null;
       ASSETS.bomb = null;
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        clear: ASSETS.sfx.clear || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3',
-        done: ASSETS.sfx.done || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3',
+        clear: ASSETS.sfx.clear || 'assets/sfx_clear.mp3',
+        done: ASSETS.sfx.done || 'assets/sfx_done.mp3',
         pop_small: ASSETS.sfx.pop_small || null,
-        paint_stroke: ASSETS.sfx.paint_stroke || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_paint_stroke.mp3'
+        paint_stroke: ASSETS.sfx.paint_stroke || 'assets/sfx_paint_stroke.mp3'
       });
     } else if (currentGameId === 'shape-trace') {
       // shape-trace: dedicated bgm + shape SFX
-      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.shape ? ASSETS.bgmVariants.shape : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3';
+      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.shape ? ASSETS.bgmVariants.shape : 'assets/bgm_shape_loop.mp3';
       ASSETS.slice = null;
       ASSETS.bomb = null;
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        point: ASSETS.sfx.point || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
-        segment_complete: ASSETS.sfx.segment_complete || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3',
-        shape_complete: ASSETS.sfx.shape_complete || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3',
+        point: ASSETS.sfx.point || 'assets/sfx_point.mp3',
+        segment_complete: ASSETS.sfx.segment_complete || 'assets/sfx_segment_complete.mp3',
+        shape_complete: ASSETS.sfx.shape_complete || 'assets/sfx_shape_complete.mp3',
         popup: ASSETS.sfx.popup || null,
-        wrong: ASSETS.sfx.wrong || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3'
+        wrong: ASSETS.sfx.wrong || 'assets/sfx_wrong.mp3'
       });
     } else if (currentGameId === 'runner-control') {
       // runner-control: runner bgm and gameplay SFX
-      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.runner ? ASSETS.bgmVariants.runner : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3';
+      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.runner ? ASSETS.bgmVariants.runner : 'assets/bgm_runner_loop.mp3';
       ASSETS.slice = null;
       ASSETS.bomb = null;
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        point: ASSETS.sfx.point || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
-        bomb: ASSETS.sfx.bomb || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_hit.mp3',
+        point: ASSETS.sfx.point || 'assets/sfx_point.mp3',
+        bomb: ASSETS.sfx.bomb || 'assets/sfx_hit.mp3',
         popup: ASSETS.sfx.popup || null,
-        jump: ASSETS.sfx.jump || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_jump.mp3'
+        jump: ASSETS.sfx.jump || 'assets/sfx_jump.mp3'
       });
     } else if (currentGameId === 'maze-mini') {
       // maze-mini: maze bgm and feedback SFX
-      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.maze ? ASSETS.bgmVariants.maze : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3';
+      ASSETS.bgm = ASSETS.bgmVariants && ASSETS.bgmVariants.maze ? ASSETS.bgmVariants.maze : 'assets/bgm_maze_loop.mp3';
       ASSETS.slice = null;
       ASSETS.bomb = null;
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        point: ASSETS.sfx.point || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
-        segment_complete: ASSETS.sfx.segment_complete || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3',
-        wrong: ASSETS.sfx.wrong || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3',
+        point: ASSETS.sfx.point || 'assets/sfx_point.mp3',
+        segment_complete: ASSETS.sfx.segment_complete || 'assets/sfx_segment_complete.mp3',
+        wrong: ASSETS.sfx.wrong || 'assets/sfx_wrong.mp3',
         popup: ASSETS.sfx.popup || null
       });
     } else {
       // fallback: try top-level files using the conventional names while preserving the global sfx map
-      ASSETS.bgm = ASSETS.bgm || `https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3`;
-      ASSETS.slice = ASSETS.slice || `https://ali-ezz.github.io/hand-traking-games/assets/slice.mp3`;
-      ASSETS.bomb = ASSETS.bomb || `https://ali-ezz.github.io/hand-traking-games/assets/bomb.mp3`;
+      ASSETS.bgm = ASSETS.bgm || `assets/bgm.mp3`;
+      ASSETS.slice = ASSETS.slice || `assets/slice.mp3`;
+      ASSETS.bomb = ASSETS.bomb || `assets/bomb.mp3`;
       ASSETS.sfx = Object.assign({}, ASSETS.sfx, {
-        point: ASSETS.sfx.point || 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
+        point: ASSETS.sfx.point || 'assets/sfx_point.mp3',
         popup: ASSETS.sfx.popup || null
       });
     }
@@ -5579,17 +5579,17 @@ function updateGameBGM(newGameId, { force = false } = {}) {
   // Set up per-game assets and update ASSETS.bgm
   let newBgm = null;
   if (newGameId === 'ninja-fruit') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
+    newBgm = 'assets/bgm.mp3';
   } else if (newGameId === 'paint-air') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3';
+    newBgm = 'assets/bgm_paint_loop.mp3';
   } else if (newGameId === 'shape-trace') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3';
+    newBgm = 'assets/bgm_shape_loop.mp3';
   } else if (newGameId === 'runner-control') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3';
+    newBgm = 'assets/bgm_runner_loop.mp3';
   } else if (newGameId === 'maze-mini') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3';
+    newBgm = 'assets/bgm_maze_loop.mp3';
   } else {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3'; // fallback
+    newBgm = 'assets/bgm.mp3'; // fallback
   }
   
   ASSETS.bgm = newBgm;

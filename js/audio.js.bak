@@ -289,31 +289,31 @@ Fallback:
     static defaultMap() {
       return {
         // BGMs
-        'bgm': 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3',
-        'bgm_maze_loop': 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3',
-        'bgm_paint_loop': 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3',
-        'bgm_runner_loop': 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3',
-        'bgm_shape_loop': 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3',
+        'bgm': 'assets/bgm.mp3',
+        'bgm_maze_loop': 'assets/bgm_maze_loop.mp3',
+        'bgm_paint_loop': 'assets/bgm_paint_loop.mp3',
+        'bgm_runner_loop': 'assets/bgm_runner_loop.mp3',
+        'bgm_shape_loop': 'assets/bgm_shape_loop.mp3',
 
         // SFX
-        'sfx_jump': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_jump.mp3',
-        'sfx_hit': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_hit.mp3',
-        'sfx_point': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3',
-        'sfx_pop_small': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_pop_small.mp3',
-        'sfx_popup': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_popup.mp3',
-        'sfx_segment_complete': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3',
-        'sfx_shape_complete': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3',
-        'sfx_wrong': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3',
-        'sfx_clear': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3',
-        'sfx_done': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3',
-        'sfx_eraser': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_eraser.mp3',
-        'sfx_paint_stroke': 'https://ali-ezz.github.io/hand-traking-games/assets/sfx_paint_stroke.mp3',
+        'sfx_jump': 'assets/sfx_jump.mp3',
+        'sfx_hit': 'assets/sfx_hit.mp3',
+        'sfx_point': 'assets/sfx_point.mp3',
+        'sfx_pop_small': 'assets/sfx_pop_small.mp3',
+        'sfx_popup': 'assets/sfx_popup.mp3',
+        'sfx_segment_complete': 'assets/sfx_segment_complete.mp3',
+        'sfx_shape_complete': 'assets/sfx_shape_complete.mp3',
+        'sfx_wrong': 'assets/sfx_wrong.mp3',
+        'sfx_clear': 'assets/sfx_clear.mp3',
+        'sfx_done': 'assets/sfx_done.mp3',
+        'sfx_eraser': 'assets/sfx_eraser.mp3',
+        'sfx_paint_stroke': 'assets/sfx_paint_stroke.mp3',
 
         // slice / bomb / fruit
-        'slice': 'https://ali-ezz.github.io/hand-traking-games/assets/slice.mp3',
-        'slice-fruit': 'https://ali-ezz.github.io/hand-traking-games/assets/slice-frute.mp3',
-        'bomb': 'https://ali-ezz.github.io/hand-traking-games/assets/bomb.mp3',
-        'bomb-frute': 'https://ali-ezz.github.io/hand-traking-games/assets/bomb-frute.mp3'
+        'slice': 'assets/slice.mp3',
+        'slice-fruit': 'assets/slice-frute.mp3',
+        'bomb': 'assets/bomb.mp3',
+        'bomb-frute': 'assets/bomb-frute.mp3'
       };
     }
   }

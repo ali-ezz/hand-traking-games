@@ -18,11 +18,11 @@ task_progress
   <title>Camera Hand-Tracking Games</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%23111'/%3E%3Ctext%20x='50%25'%20y='50%25'%20fill='%23fff'%20font-size='10'%20text-anchor='middle'%20dy='.35em'%3EHN%3C/text%3E%3C/svg%3E" />
   <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%23111'/%3E%3Ctext%20x='50%25'%20y='50%25'%20fill='%23fff'%20font-size='10'%20text-anchor='middle'%20dy='.35em'%3EHN%3C/text%3E%3C/svg%3E" />
-  <link rel="preload" href="https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3" as="audio">
-  <link rel="preload" href="https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3" as="audio">
-  <link rel="preload" href="https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3" as="audio">
-  <link rel="preload" href="https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3" as="audio">
-  <link rel="preload" href="https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_maze_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_paint_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_runner_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_shape_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm.mp3" as="audio">
   <style>
     :root { --bg:#111; --ui:#fff; --accent:#ff4d4d; }
     html,body { height:100%; margin:0; background:var(--bg); color:var(--ui); font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }

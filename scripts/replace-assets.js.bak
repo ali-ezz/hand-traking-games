@@ -1,0 +1,82 @@
+#!/usr/bin/env node
+/*
+Replace local /assets/ paths with a GitHub Pages assets URL across .html, .js, and .css files.
+
+Usage:
+  node scripts/replace-assets.js [baseUrl]
+
+Example:
+  node scripts/replace-assets.js https://ali-ezz.github.io/hand-traking-games/assets
+
+If no baseUrl is provided, the script defaults to:
+  https://ali-ezz.github.io/hand-traking-games/assets
+
+The script:
+- Scans the project recursively (skips node_modules and .git)
+- Replaces occurrences like "/assets/..." or "assets/..." in strings and url(...) values
+- Saves a backup for each modified file as filename.bak
+- Prints a list of updated files
+*/
+
+const fs = require('fs').promises;
+const path = require('path');
+
+const root = process.cwd();
+const arg = process.argv[2] || 'https://ali-ezz.github.io/hand-traking-games/assets';
+
+// Normalize base to end with 'assets/'
+let base = arg.endsWith('/') ? arg.slice(0, -1) : arg;
+if (!base.endsWith('/assets')) base = base + '/assets';
+const baseAssets = base.endsWith('/') ? base : base + '/';
+
+const exts = new Set(['.html', '.js', '.css']);
+
+async function walk(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  let files = [];
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name === 'node_modules' || e.name === '.git') continue;
+      files = files.concat(await walk(full));
+    } else {
+      if (exts.has(path.extname(e.name))) files.push(full);
+    }
+  }
+  return files;
+}
+
+(async () => {
+  try {
+    const files = await walk(root);
+    const replaced = [];
+
+    // Matches quoted occurrences: " /assets/... or 'assets/...
+    const patternQuoted = /(["'`])\/?assets\//g;
+    // Matches url(...) occurrences: url(/assets/... or url('assets/...
+    const patternUrl = /url\(\s*(['"])?\/?assets\//g;
+
+    for (const file of files) {
+      const src = await fs.readFile(file, 'utf8');
+      let out = src.replace(patternQuoted, (m, q) => `${q}${baseAssets}`);
+      out = out.replace(patternUrl, (m, q) => `url(${q || ''}${baseAssets}`);
+      if (out !== src) {
+        await fs.copyFile(file, file + '.bak');
+        await fs.writeFile(file, out, 'utf8');
+        replaced.push(path.relative(root, file));
+        console.log('Updated:', path.relative(root, file));
+      }
+    }
+
+    if (replaced.length === 0) {
+      console.log('No matches found for /assets/ in scanned files.');
+    } else {
+      console.log('');
+      console.log('Replaced paths in', replaced.length, 'file(s). Backups saved as <filename>.bak');
+      console.log('Review changes, then commit them (git add ... && git commit -m "Replace asset paths with GitHub Pages URLs")');
+    }
+  } catch (err) {
+    console.error('Error:', err);
+    process.exit(1);
+  }
+})();

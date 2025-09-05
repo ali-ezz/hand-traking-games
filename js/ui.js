@@ -318,21 +318,6 @@ Purpose:
       // sync the basic smallBar and the main body panels depending on room/admin state
       updateSmallBar();
 
-      // Also ensure the main Play button is hidden for non-admin room members
-      try {
-        const menuStartBtn = document.getElementById('menuStartBtn');
-        if (menuStartBtn) {
-          if (!STATE.room) {
-            menuStartBtn.style.display = '';
-          } else if (!STATE.isAdmin) {
-            // remove Play for non-admins (keep Leaderboard visible)
-            menuStartBtn.style.display = 'none';
-          } else {
-            menuStartBtn.style.display = '';
-          }
-        }
-      } catch (e) {}
-
       // Hide/show game selection controls based on room membership and admin status
       const gameSelect = document.getElementById('gameSelect');
       const gameLength = document.getElementById('gameLength');
@@ -380,9 +365,10 @@ Purpose:
       // admin vs non-admin UI
       if (STATE.isAdmin) {
         renderAdminPanel(STATE.room);
-        const info = ensureRoomInfoEl();        info.querySelector('.rooms-waiting-panel').style.display = 'none';
+        const info = ensureRoomInfoEl();
+        info.querySelector('.rooms-waiting-panel').style.display = 'none';
       } else {
-        // non-admin: only show waiting panel (Play is hidden above)
+        // non-admin: only show waiting panel and disable menu start button via capture listener
         renderWaitingPanel();
       }
     }
