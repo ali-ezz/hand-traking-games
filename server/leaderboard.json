@@ -1,0 +1,92 @@
+{
+  "ninja-fruit": [
+    {
+      "name": "Player",
+      "score": 200,
+      "ts": 1757006132588
+    },
+    {
+      "name": "wow",
+      "score": 100,
+      "ts": 1757032783848
+    },
+    {
+      "name": "2",
+      "score": 80,
+      "ts": 1757006965603
+    },
+    {
+      "name": "jj",
+      "score": 20,
+      "ts": 1757032910548
+    }
+  ],
+  "maze-mini": [
+    {
+      "name": "Player",
+      "score": 600,
+      "ts": 1756927517208
+    },
+    {
+      "name": "hhh",
+      "score": 200,
+      "ts": 1757032362592
+    },
+    {
+      "name": "Uui",
+      "score": 100,
+      "ts": 1757025115119
+    },
+    {
+      "name": "hh",
+      "score": 100,
+      "ts": 1757050835031
+    },
+    {
+      "name": "Hhuu",
+      "score": 0,
+      "ts": 1757023312081
+    },
+    {
+      "name": "Huhu",
+      "score": 0,
+      "ts": 1757045607030
+    }
+  ],
+  "runner-control": [
+    {
+      "name": "Huhu",
+      "score": 85,
+      "ts": 1757045749573
+    },
+    {
+      "name": "Player",
+      "score": 75,
+      "ts": 1756945279778
+    }
+  ],
+  "shape-trace": [
+    {
+      "name": "Player",
+      "score": 252,
+      "ts": 1757046009070
+    },
+    {
+      "name": "Huhu",
+      "score": 162,
+      "ts": 1757045834257
+    }
+  ],
+  "paint-air": [
+    {
+      "name": "Huhu",
+      "score": 0,
+      "ts": 1757045494886
+    },
+    {
+      "name": "Player",
+      "score": 0,
+      "ts": 1757048082806
+    }
+  ]
+}

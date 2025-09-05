@@ -16,6 +16,13 @@ task_progress
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Camera Hand-Tracking Games</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%23111'/%3E%3Ctext%20x='50%25'%20y='50%25'%20fill='%23fff'%20font-size='10'%20text-anchor='middle'%20dy='.35em'%3EHN%3C/text%3E%3C/svg%3E" />
+  <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%23111'/%3E%3Ctext%20x='50%25'%20y='50%25'%20fill='%23fff'%20font-size='10'%20text-anchor='middle'%20dy='.35em'%3EHN%3C/text%3E%3C/svg%3E" />
+  <link rel="preload" href="assets/bgm_maze_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_paint_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_runner_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm_shape_loop.mp3" as="audio">
+  <link rel="preload" href="assets/bgm.mp3" as="audio">
   <style>
     :root { --bg:#111; --ui:#fff; --accent:#ff4d4d; }
     html,body { height:100%; margin:0; background:var(--bg); color:var(--ui); font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
@@ -33,18 +40,36 @@ task_progress
     .leader-row .rank { font-weight:700; color:var(--accent); text-align:left; }
     .leader-row .name { overflow:hidden; text-overflow:ellipsis; }
     .leader-row .leader-score { text-align:right; font-variant-numeric: tabular-nums; }
+
+    /* HUD pulse animation used by the game for tactile score feedback */
+    .score.pulse {
+      animation: pulse 360ms ease;
+      transform-origin: center center;
+    }
+    @keyframes pulse {
+      0%   { transform: scale(1); box-shadow: 0 0 0 rgba(255,255,255,0); }
+      50%  { transform: scale(1.08); box-shadow: 0 8px 20px rgba(0,0,0,0.35); }
+      100% { transform: scale(1); box-shadow: 0 0 0 rgba(255,255,255,0); }
+    }
+
+    /* Smooth notice opacity transitions */
+    #notice { transition: opacity 280ms ease, transform 280ms ease; opacity:1; }
+
+    /* Subtle button hover */
+    .btn:hover { transform: translateY(-2px); transition: transform 140ms ease; }
+
   </style>
 </head>
 <body>
   <div class="wrap">
     <!-- MediaPipe will provide image frames which we draw onto the canvas.
          The user sees a live camera frame plus overlays (hands + game objects). -->
-    <video id="input_video" style="display:none"></video>
+    <video id="input_video" style="visibility:hidden; width:1px; height:1px; position:absolute; left:0; top:0;"></video>
     <canvas id="output_canvas"></canvas>
 
     <!-- Menu overlay before game starts -->
-    <div id="menu" style="position:absolute; z-index:30; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:auto;">
-      <div style="background:rgba(0,0,0,0.7); padding:20px; border-radius:12px; width:360px; color:#fff; text-align:center;">
+    <div id="menu" style="position:absolute; z-index:30; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;">
+      <div style="background:rgba(0,0,0,0.7); padding:20px; border-radius:12px; width:360px; color:#fff; text-align:center; pointer-events:auto;">
         <h2 style="margin:0 0 8px 0;">Hand Ninja</h2>
 
         <div style="display:flex; gap:8px; margin-bottom:10px;">
@@ -140,6 +165,11 @@ task_progress
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <!-- Realtime / Rooms (task_progress: 4/7) -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="js/net.js"></script>
+  <script src="js/ui.js"></script>
 
   <!-- Game logic -->
   <script type="module" src="js/game.js"></script>
