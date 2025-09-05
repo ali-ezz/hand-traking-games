@@ -272,6 +272,29 @@ Notes:
       });
     },
 
+    // Convenience wrappers for server actions used by UI
+    setDisplayName(name, cb) {
+      if (!this.socket) return cb && cb({ ok: false, reason: 'not_connected' });
+      try {
+        this.socket.emit('set_display_name', { name }, (res) => {
+          if (cb) cb(res);
+        });
+      } catch (e) {
+        if (cb) cb({ ok: false, reason: 'error' });
+      }
+    },
+
+    kickPlayer(id, cb) {
+      if (!this.socket) return cb && cb({ ok: false, reason: 'not_connected' });
+      try {
+        this.socket.emit('kick_player', { id }, (res) => {
+          if (cb) cb(res);
+        });
+      } catch (e) {
+        if (cb) cb({ ok: false, reason: 'error' });
+      }
+    },
+
     sendClientReady(payload = {}, cb) {
       // Try multiple transport styles so client code can call NET.sendClientReady reliably.
       // Returns immediately; if the transport supports an ack it will call cb.

@@ -314,13 +314,69 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
     if (room.admin !== socket.id) { if (cb) cb({ ok: false, reason: 'not_admin' }); return; }
-    if (room.status === 'running') { if (cb) cb({ ok: false, reason: 'already_running' }); return; }
+
+    // basic request log for debugging / audit
+    try { console.log('start_room_game request', { socket: socket.id, room: roomId, opts }); } catch(e){}
+
+    // Allow caller to override game/timeLimit atomically and support forced replace
+    try {
+      const { game, timeLimit, replace } = opts || {};
+      if (typeof game === 'string') room.game = game;
+      if (typeof timeLimit === 'number') room.timeLimit = Math.max(5, Math.min(3600, Math.floor(timeLimit)));
+      try { console.log(`room:${roomId} options updated by ${socket.id}`, { game: room.game, timeLimit: room.timeLimit, replace: !!replace }); } catch(e){}
+    } catch (e) {}
+
+    // Prevent concurrent start requests
+    if (room.starting) {
+      if (cb) cb({ ok: false, reason: 'busy' });
+      return;
+    }
+
+    // If a run is already active and caller didn't request replace -> reject immediately
+    if (room.status === 'running' && !(opts && opts.replace)) {
+      if (cb) cb({ ok: false, reason: 'already_running' });
+      return;
+    }
+
+    // If a run is already active and caller requested replace -> stop it cleanly and notify clients before starting the new one.
+    if (room.status === 'running' && (opts && opts.replace)) {
+      room.starting = true;
+      try { if (room.beginTimer) { clearTimeout(room.beginTimer); room.beginTimer = null; } } catch(e){}
+      try { if (room.endTimer) { clearTimeout(room.endTimer); room.endTimer = null; } } catch(e){}
+      const prevEnd = room.endTs;
+      room.status = 'waiting';
+      room.startTs = null;
+      room.endTs = null;
+      try {
+        try { console.log(`room:${roomId} replacing active run (requested by ${socket.id}) prevEnd=${prevEnd}`); } catch(e){}
+        io.to(roomId).emit('game_end', { reason: 'replaced', endTs: prevEnd });
+        io.to(roomId).emit('room_update', {
+          id: room.id,
+          public: room.public,
+          admin: room.admin,
+          game: room.game,
+          timeLimit: room.timeLimit,
+          status: room.status,
+          players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+        });
+        try { console.log(`room:${roomId} broadcasted replacement game_end`); } catch(e){}
+      } catch (e) {
+        console.warn('Failed to broadcast replacement game_end for room', roomId, e);
+      } finally {
+        room.starting = false;
+      }
+    }
+
+    // Start the new room run
     room.status = 'running';
     const kickoffDelayMs = 3000;
     const startTs = Date.now() + kickoffDelayMs;
     const seed = Math.floor(Math.random() * 0x7fffffff);
     room.startTs = startTs;
     room.endTs = room.startTs + (room.timeLimit || 60) * 1000;
+    try { console.log(`room:${roomId} starting game`, { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, requestedBy: socket.id }); } catch(e){}
+
+    // emit updated room metadata and a game_start notification
     io.to(roomId).emit('room_update', {
       id: room.id,
       public: room.public,
@@ -331,11 +387,160 @@ io.on('connection', (socket) => {
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
     io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed });
+
+    // schedule authoritative game_begin at the startTs
     const __delay = Math.max(0, room.startTs - Date.now());
-    setTimeout(() => {
-      try { io.to(roomId).emit('game_begin', { startTime: room.startTs, seed }); } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
+    room.beginTimer = setTimeout(() => {
+      try {
+        io.to(roomId).emit('game_begin', { startTime: room.startTs, seed });
+      } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
+      room.beginTimer = null;
     }, __delay);
+
+    // schedule authoritative game_end at the endTs
+    const endDelay = Math.max(0, room.endTs - Date.now());
+    room.endTimer = setTimeout(() => {
+      try {
+        // mark not running and notify clients
+        room.status = 'waiting';
+        const prevEndTs = room.endTs;
+        room.startTs = null;
+        room.endTs = null;
+
+        try { console.log(`room:${roomId} game ended (timeup) prevEndTs=${prevEndTs}`); } catch(e){}
+        io.to(roomId).emit('game_end', { reason: 'timeup', endTs: prevEndTs });
+        io.to(roomId).emit('room_update', {
+          id: room.id,
+          public: room.public,
+          admin: room.admin,
+          game: room.game,
+          timeLimit: room.timeLimit,
+          status: room.status,
+          players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+        });
+      } catch (e) {
+        console.warn('Failed to emit game_end for room', roomId, e);
+      } finally {
+        room.endTimer = null;
+      }
+    }, endDelay);
+
     if (cb) cb({ ok: true });
+  });
+
+  // Admin can stop a running room game early
+  socket.on('stop_room_game', (opts = {}, cb) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+    const room = rooms[roomId];
+    if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+    if (room.admin !== socket.id) { if (cb) cb({ ok: false, reason: 'not_admin' }); return; }
+    if (room.status !== 'running') { if (cb) cb({ ok: false, reason: 'not_running' }); return; }
+
+    try { console.log(`room:${roomId} stop requested by admin ${socket.id} prevEnd=${room.endTs}`); } catch(e){}
+
+    try { if (room.beginTimer) { clearTimeout(room.beginTimer); room.beginTimer = null; } } catch(e){}
+    try { if (room.endTimer) { clearTimeout(room.endTimer); room.endTimer = null; } } catch(e){}
+
+    room.status = 'waiting';
+    const prevEnd = room.endTs;
+    room.startTs = null;
+    room.endTs = null;
+
+    io.to(roomId).emit('game_end', { reason: 'stopped', endTs: prevEnd });
+    io.to(roomId).emit('room_update', {
+      id: room.id,
+      public: room.public,
+      admin: room.admin,
+      game: room.game,
+      timeLimit: room.timeLimit,
+      status: room.status,
+      players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+    });
+
+    if (cb) cb({ ok: true });
+  });
+
+  // Update display name and broadcast to room
+  socket.on('set_display_name', (opts = {}, cb) => {
+    try {
+      const name = (opts && typeof opts.name === 'string') ? opts.name.trim().slice(0, 64) : '';
+      if (!name) { if (cb) cb({ ok: false, reason: 'invalid_name' }); return; }
+      const roomId = socket.data.roomId;
+      if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+      const room = rooms[roomId];
+      if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      socket.data.displayName = name;
+      if (room.players.has(socket.id)) {
+        room.players.set(socket.id, { name });
+      }
+      io.to(roomId).emit('room_update', {
+        id: room.id,
+        public: room.public,
+        admin: room.admin,
+        game: room.game,
+        timeLimit: room.timeLimit,
+        status: room.status,
+        players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+      });
+      if (cb) cb({ ok: true });
+    } catch (e) {
+      if (cb) cb({ ok: false, reason: 'error' });
+    }
+  });
+
+  // Admin can kick a player from the room
+  socket.on('kick_player', (opts = {}, cb) => {
+    try {
+      const targetId = opts && opts.id;
+      const roomId = socket.data.roomId;
+      if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+      const room = rooms[roomId];
+      if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      if (room.admin !== socket.id) { if (cb) cb({ ok: false, reason: 'not_admin' }); return; }
+      if (!targetId || !room.players.has(targetId)) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      if (targetId === room.admin) { if (cb) cb({ ok: false, reason: 'cannot_kick_admin' }); return; }
+
+      // Remove from room state
+      room.players.delete(targetId);
+      const targetSock = io.sockets.sockets.get ? io.sockets.sockets.get(targetId) : io.sockets.connected && io.sockets.connected[targetId];
+      if (targetSock) {
+        try {
+          targetSock.leave(roomId);
+          delete targetSock.data.roomId;
+          delete targetSock.data.displayName;
+          try { targetSock.emit('kicked', { by: socket.id, room: roomId }); } catch (e) {}
+        } catch (e) {}
+      }
+
+      // Reassign admin if needed
+      if (!room.admin && room.players.size > 0) {
+        room.admin = room.players.keys().next().value;
+      }
+
+      io.to(roomId).emit('peer_leave', { id: targetId });
+      io.to(roomId).emit('room_update', {
+        id: room.id,
+        public: room.public,
+        admin: room.admin,
+        game: room.game,
+        timeLimit: room.timeLimit,
+        status: room.status,
+        players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+      });
+
+      // schedule cleanup if empty
+      if (room.players.size === 0) {
+        room.cleanupTimer = setTimeout(() => {
+          delete rooms[roomId];
+          broadcastRoomList();
+        }, 30_000);
+      }
+
+      if (cb) cb({ ok: true });
+    } catch (e) {
+      if (cb) cb({ ok: false, reason: 'error' });
+    }
   });
 
   // Hand frames: validate, cache last state, forward to peers
@@ -406,6 +611,29 @@ io.on('connection', (socket) => {
       // simply forward request to room
       socket.to(roomId).emit('peer_request_state', data || {});
     } catch (e) {}
+  });
+
+  // Allow clients to request an authoritative room update from the server.
+  // This is used by clients that want the latest players/metadata immediately.
+  socket.on('request_room_update', (opts = {}, cb) => {
+    try {
+      const roomId = socket.data.roomId;
+      if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+      const room = rooms[roomId];
+      if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      io.to(roomId).emit('room_update', {
+        id: room.id,
+        public: room.public,
+        admin: room.admin,
+        game: room.game,
+        timeLimit: room.timeLimit,
+        status: room.status,
+        players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
+      });
+      if (cb) cb({ ok: true });
+    } catch (e) {
+      if (cb) cb({ ok: false, reason: 'error' });
+    }
   });
 
   socket.on('disconnect', () => {

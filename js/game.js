@@ -86,21 +86,22 @@ function showWaitingForPlayersOverlay(show, text) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'rgba(0,0,0,0.62)',
+        background: 'transparent', // keep video visible behind overlay
         color: '#fff',
         zIndex: 99990,
         fontSize: '18px',
-        pointerEvents: 'auto'
+        pointerEvents: 'none' // allow interacting with underlying UI while status is shown
       });
       const inner = document.createElement('div');
       inner.id = 'waitingOverlayInner';
       Object.assign(inner.style, {
         padding: '18px 22px',
         borderRadius: '10px',
-        background: 'rgba(0,0,0,0.76)',
+        background: 'rgba(0,0,0,0.62)',
         boxShadow: '0 6px 24px rgba(0,0,0,0.6)',
         textAlign: 'center',
         maxWidth: '80%',
+        pointerEvents: 'none' // non-blocking UI: allow clicks to pass through while still showing status
       });
       inner.textContent = text || 'Waiting for other players to be ready…';
       el.appendChild(inner);
@@ -802,11 +803,11 @@ const ASSETS = (() => {
 
     const sfx = {
     point: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_point.mp3']),
-    popup: null,
+    popup: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_popup.mp3']),
     segment_complete: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_segment_complete.mp3']),
     shape_complete: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_shape_complete.mp3']),
     wrong: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_wrong.mp3']),
-    pop_small: null,
+    pop_small: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_pop_small.mp3']),
     clear: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_clear.mp3']),
     done: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_done.mp3']),
     eraser: pick(['https://ali-ezz.github.io/hand-traking-games/assets/sfx_eraser.mp3']),
@@ -857,6 +858,222 @@ const ASSETS = (() => {
 const soundPool = {};
 let bgmAudio = null;
 let musicEnabled = false;
+
+/* Centralized music controller to unify BGM behavior between solo and room flows.
+   - Only admin (or a server-forced flag) will actually start playback for a room.
+   - Non-admins will preload/ decode but will not auto-play when in a room.
+   - Provides safe start/stop that tears down all previous sources to avoid bleed/glitches.
+*/
+if (!window.__handNinja) window.__handNinja = {};
+window.__handNinja.musicController = (function() {
+  let _enabled = !!musicEnabled;
+  let _bgmUrl = ASSETS && ASSETS.bgm ? ASSETS.bgm : null;
+  let _isAdmin = false;
+  let _inRoom = false;
+  // internal counter to ignore stale/overlapping start attempts
+  let _startCounter = 0;
+
+  function isAllowedToPlay() {
+    // Allowed when not in a room (solo) OR when client is admin.
+    return !_inRoom || _isAdmin;
+  }
+
+  function setRoomState({ inRoom, isAdmin }) {
+    _inRoom = !!inRoom;
+    _isAdmin = !!isAdmin;
+    // record global flag for other code paths
+    try { if (typeof window !== 'undefined') { window.__handNinja._musicIsAdmin = _isAdmin; } } catch(e){}
+  }
+
+  function setEnabled(v) {
+    _enabled = !!v;
+    musicEnabled = !!v;
+    // store preference locally
+    try { localStorage.setItem('music_pref', _enabled ? '1' : '0'); } catch(e){}
+    if (!_enabled) stop(); // immediate stop on disable
+  }
+
+  async function preload(bgmUrl) {
+    if (!bgmUrl) return;
+    try {
+      // small debug trace for preload attempts
+      try { console.debug && console.debug('musicController.preload start', { bgmUrl }); } catch(e){}
+      // update cached ASSETS.bgm
+      _bgmUrl = bgmUrl;
+      ASSETS.bgm = bgmUrl;
+      // attempt to decode into WebAudio buffer (best-effort)
+      try { ensureAudioCtx(); } catch(e){}
+      try {
+        if (typeof decodeBgmBuffer === 'function') {
+          const _buf = await decodeBgmBuffer(bgmUrl).catch(()=>null);
+          try { console.debug && console.debug('musicController.preload decoded', { bgmUrl, ok: !!_buf }); } catch(e){}
+        }
+      } catch(e){
+        try { console.warn && console.warn('musicController.preload decode failed', e); } catch(e){}
+      }
+    } catch(e){}
+  }
+
+  function start(bgmUrl, { force = false, vol = 0.6 } = {}) {
+    try {
+      // debug entry: surface decision context for easier runtime tracing
+      try { console.debug && console.debug('musicController.start called', { bgmUrl, force, vol, musicEnabled: _enabled, inRoom: _inRoom, isAdmin: _isAdmin, cachedBgm: _bgmUrl }); } catch(e){}
+      if (!bgmUrl && !_bgmUrl) return false;
+      const url = bgmUrl || _bgmUrl;
+      if (!url) return false;
+
+      // don't auto-play when in-room and not admin unless forced
+      if (!force && !_enabled) return false;
+      if (!force && !isAllowedToPlay()) {
+        // only preload in this case
+        try { preload(url); } catch(e){}
+        return false;
+      }
+
+      // idempotent start: if same bgm url already playing, no-op to avoid duplicates
+      try {
+        if (_bgmUrl === url) {
+          try {
+            if (typeof decodedBgmPlaying !== 'undefined' && decodedBgmPlaying) return true;
+            if (typeof bgmAudio !== 'undefined' && bgmAudio && !bgmAudio.paused) return true;
+            const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
+            if (sa && sa.bgm && typeof sa.bgm.src === 'string' && sa.bgm.src === url) return true;
+          } catch(e){}
+        }
+      } catch(e){}
+
+      // register a local start id to ignore stale/overlapping starts
+      const _localStartId = ++_startCounter;
+
+      // stop everything first to prevent overlap/bleed
+      try { stopAllAudio(); } catch(e){}
+
+      // prefer decoded WebAudio if available
+      try {
+        if (sfxBuffers && sfxBuffers['bgm']) {
+          try {
+            const ctx = ensureAudioCtx();
+            if (!ctx) throw new Error('no-audioctx');
+            stopDecodedBgm();
+            const src = ctx.createBufferSource();
+            src.buffer = sfxBuffers['bgm'];
+            src.loop = true;
+            const g = ctx.createGain();
+            g.gain.value = vol;
+            src.connect(g);
+            g.connect(ctx.destination);
+            try { src.start(0); } catch(e){}
+            // Only register decoded node if this start is still the most recent request.
+            if (_localStartId === _startCounter) {
+              decodedBgmNode = { source: src, gain: g, url };
+              decodedBgmPlaying = true;
+              return true;
+            } else {
+              // stale start: stop and disconnect immediately
+              try { src.stop && src.stop(0); } catch(e){}
+              try { src.disconnect && src.disconnect(); } catch(e){}
+              try { g.disconnect && g.disconnect(); } catch(e){}
+              return false;
+            }
+          } catch (e) {
+            // fallthrough to other methods
+            console.warn('musicController: decoded WebAudio start failed', e);
+          }
+        }
+      } catch(e){}
+
+      // try SimpleAudio
+      try {
+        const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
+        if (sa && sa.unlocked) {
+          try {
+            sa.stopBgm();
+            sa.map.bgm = url;
+            sa.playBgm('bgm', vol);
+            // ensure this start is still current
+            if (_localStartId === _startCounter) {
+              return true;
+            } else {
+              try { sa.stopBgm(); } catch(e){}
+              return false;
+            }
+          } catch(e) {
+            console.warn('musicController: SimpleAudio start failed', e);
+          }
+        }
+      } catch(e){}
+
+      // HTMLAudio fallback
+      try {
+        const startId = _localStartId;
+        const inst = new Audio(url);
+        inst.loop = true;
+        inst.volume = Math.max(0, Math.min(1, vol));
+        inst.play().then(()=> {
+          // Only register this instance if it's the most recent start request.
+          if (startId === _startCounter) {
+            bgmAudio = inst;
+            soundPool.bgm = inst;
+          } else {
+            // stale start: tear down this instance immediately
+            try { inst.pause(); inst.src = ''; } catch(e){}
+          }
+        }).catch((err) => {
+          console.warn('musicController: HTMLAudio play failed', err);
+        });
+        return true;
+      } catch(e){
+        console.warn('musicController: HTMLAudio creation failed', e);
+      }
+      return false;
+    } catch(e){ console.warn('musicController.start failed', e); return false; }
+  }
+
+  function stop() {
+    try {
+      // invalidate any pending starts so asynchronous play() handlers will be ignored
+      try { _startCounter++; } catch(e){}
+      // reuse existing global stopAllAudio which is comprehensive
+      try { stopAllAudio(); } catch(e){}
+    } catch(e){}
+  }
+
+  function onRoomUpdate(data) {
+    try {
+      setRoomState({ inRoom: !!(data && data.room), isAdmin: !!(data && data.isAdmin) });
+      // if we are non-admin and music is enabled, don't auto-start; just preload bgm
+      if (data && data.bgmUrl) preload(data.bgmUrl).catch(()=>{});
+    } catch(e){}
+  }
+
+  function onGameBegin(data) {
+    try {
+      // server may include a flag 'forcePlayAll' to request all clients play BGM
+      const forceAll = !!(data && data.forcePlayAll);
+      const url = (data && data.bgmUrl) ? data.bgmUrl : (ASSETS && ASSETS.bgm) ? ASSETS.bgm : _bgmUrl;
+      if (!url) return;
+      preload(url).catch(()=>{});
+      if (forceAll) {
+        // start on all clients if user allowed music
+        if (_enabled) start(url, { force: true });
+      } else {
+        // otherwise only admin or solo starts
+        if (isAllowedToPlay() && _enabled) start(url, { force: false });
+      }
+    } catch(e){ console.warn('musicController.onGameBegin failed', e); }
+  }
+
+  return {
+    setEnabled,
+    start,
+    stop,
+    preload,
+    setRoomState,
+    onRoomUpdate,
+    onGameBegin,
+    getState: () => ({ enabled: _enabled, bgmUrl: _bgmUrl, isAdmin: _isAdmin, inRoom: _inRoom })
+  };
+})();
 
 // WebAudio low-latency SFX system (lazy-created on first user gesture)
 let audioCtx = null;
@@ -1374,64 +1591,46 @@ async function preloadAssets() {
     firstSuccessful(bgmCandidates, 'bgm', 6000).then(a => {
       if (a) {
         try {
+          // Ensure loop on discovered element
           a.loop = true;
-          // stop and fully tear down any previous bgm to avoid cross-game bleed and lingering fetches
+
+          // Teardown any existing bgm BEFORE assigning the new instance to avoid races/duplicate playback.
           if (bgmAudio && bgmAudio !== a) {
-            try { 
-              reportStatus('bgm', `teardown prev ${bgmAudio && bgmAudio.src ? bgmAudio.src : '<none>'} at ${Date.now()}`); 
-            } catch(e){}
+            try { reportStatus('bgm', `teardown prev ${bgmAudio && bgmAudio.src ? bgmAudio.src : '<none>'} at ${Date.now()}`); } catch(e){}
             try { bgmAudio.pause(); } catch(e){}
             try { bgmAudio.currentTime = 0; } catch(e){}
-            try { 
-              // clear src to stop playback and free network handles
-              bgmAudio.src = '';
-            } catch(e){}
             try {
-              // revoke previous object URL if the previous bgm used one (prevents lingering downloads/memory)
-              if (bgmAudio.src && typeof bgmAudio.src === 'string' && bgmAudio.src.indexOf('blob:') === 0) {
-                try { URL.revokeObjectURL(bgmAudio.src); } catch(e){}
+              // preserve previous src so we can revoke blob URLs after clearing
+              const _prevSrc = bgmAudio.src;
+              try { bgmAudio.src = ''; } catch(e){}
+              try { bgmAudio.removeAttribute && bgmAudio.removeAttribute('src'); } catch(e){}
+              try { bgmAudio.load && bgmAudio.load(); } catch(e){}
+              if (_prevSrc && typeof _prevSrc === 'string' && _prevSrc.indexOf('blob:') === 0) {
+                try { URL.revokeObjectURL(_prevSrc); } catch(e){}
               }
             } catch(e){}
+            try { delete soundPool.bgm; } catch(e){}
           }
-        } catch(e){}
-        // register new bgm in both bgmAudio and soundPool so playback switches cleanly
-        bgmAudio = a;
-        try { soundPool.bgm = a; } catch(e){}
-        reportStatus('bgm', `loaded ${a.src} at ${Date.now()}`);
 
-        // Decode bgm into WebAudio buffer and cache it like SFX for instant playback.
-        // Use preloadSfx so it leverages the same decoding path and audioCtx handling.
-        try {
+          // Register the new bgm element (single assignment)
+          bgmAudio = a;
+          try { soundPool.bgm = a; } catch(e){}
+          try { reportStatus('bgm', `loaded ${a.src} at ${Date.now()}`); } catch(e){}
+
+          // Decode bgm into WebAudio buffer in background (no autoplay).
+          // Use preloadSfx to leverage existing decode logic / AudioContext handling.
           (async () => {
-            const buf = await preloadSfx('bgm', a.src).catch(()=>null);
-            if (buf) {
-              sfxBuffers['bgm'] = buf;
-              try { reportStatus('bgm', `decoded bgm buffer ${a.src}`); } catch(e){}
-              // If music is enabled right now, start decoded playback (single node)
-              if (musicEnabled) {
-                try { playDecodedBgm(a.src, { vol: 0.8, loop: true }); } catch(e){}
+            try {
+              const buf = await preloadSfx('bgm', a.src).catch(()=>null);
+              if (buf) {
+                sfxBuffers['bgm'] = buf;
+                try { reportStatus('bgm', `decoded bgm buffer ${a.src}`); } catch(e){}
+              } else {
+                try { reportStatus('bgm', `bgm decode failed ${a.src}`); } catch(e){}
               }
-            } else {
-              try { reportStatus('bgm', `bgm decode failed ${a.src}`); } catch(e){}
-            }
+            } catch(e){}
           })();
         } catch(e){}
-
-        // Minimal HTMLAudio fallback only used if decoded buffer isn't available yet.
-        if (musicEnabled && !sfxBuffers['bgm']) {
-          try {
-            // ensure previous html bgmAudio is stopped before creating a new instance
-            if (bgmAudio && bgmAudio !== a) {
-              try { bgmAudio.pause(); } catch(e){}
-              try { bgmAudio.currentTime = 0; } catch(e){}
-              try { bgmAudio.src = ''; } catch(e){}
-            }
-            a.muted = false;
-            a.volume = 1.0;
-            a.play().catch(()=>{});
-            bgmAudio = a;
-          } catch(e){}
-        }
       } else {
         reportStatus('bgm','not found');
       }
@@ -1524,96 +1723,70 @@ function playSound(name) {
       return;
     }
 
-    if (name === 'bgm') {
-      console.log('playSound(bgm) called - musicEnabled:', musicEnabled);
-      
-      // BGM handling - ONLY play if music is enabled
-      if (!musicEnabled) {
-        console.log('Music disabled - not starting BGM');
-        return;
-      }
-        
-      // Check if music is already playing to prevent duplicates
-      const isAlreadyPlaying = (
-        (bgmAudio && !bgmAudio.paused) ||
-        (decodedBgmPlaying) ||
-        (window.__handNinja._simpleAudio && window.__handNinja._simpleAudio.bgm && !window.__handNinja._simpleAudio.bgm.paused)
-      );
-      
-      if (isAlreadyPlaying) {
-        console.log('BGM already playing - skipping duplicate');
-        return;
-      }
-      
-      // Get the current game-specific BGM URL
-      const bgmUrl = ASSETS && ASSETS.bgm ? ASSETS.bgm : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
-      console.log('Starting BGM:', bgmUrl);
-      
-      // Try SimpleAudio first for BGM (most reliable)
-      const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
-      if (sa && sa.unlocked) {
+      if (name === 'bgm') {
+        // Delegate BGM handling to centralized musicController to ensure consistent behavior
         try {
-          // Stop any existing BGM first
-          sa.stopBgm();
-          // Update SimpleAudio mapping for current BGM
-          sa.map.bgm = bgmUrl;
-          sa.playBgm('bgm', 0.5); // Lower volume to prevent overlap perception
-          console.log('Started BGM via SimpleAudio');
-          return;
-        } catch(e) {
-          console.warn('SimpleAudio BGM failed:', e);
-        }
-      }
-
-      // Try WebAudio decoded buffer for instant playback
-      const buf = (sfxBuffers && sfxBuffers['bgm']) ? sfxBuffers['bgm'] : null;
-      if (buf) {
-        try {
-          const ctx = ensureAudioCtx();
-          if (ctx) {
-            stopDecodedBgm(); // Stop any existing decoded BGM
-            const src = ctx.createBufferSource();
-            src.buffer = buf;
-            src.loop = true;
-            const g = ctx.createGain();
-            g.gain.value = 0.5; // Lower volume
-            src.connect(g);
-            g.connect(ctx.destination);
-            src.start(0);
-            decodedBgmNode = { source: src, gain: g, url: bgmUrl };
-            decodedBgmPlaying = true;
-            console.log('Started BGM via WebAudio');
+          const bgmUrl = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
+          const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
+          if (mc && typeof mc.start === 'function') {
+            // start will respect room/admin policy and the user's music preference
+            mc.start(bgmUrl, { force: false, vol: 0.6 });
             return;
           }
-        } catch (e) { 
-          console.warn('WebAudio BGM failed:', e); 
+        } catch (e) {
+          console.warn('playSound delegated to musicController failed', e);
         }
-      }
 
-      // HTMLAudio fallback - create new instance for current BGM
-      try {
-        // Stop any existing HTMLAudio BGM first
-        if (bgmAudio) {
-          bgmAudio.pause();
-          bgmAudio.currentTime = 0;
-          bgmAudio = null;
+        // Fallback older behavior if controller missing: only play when musicEnabled and not in-room non-admin
+        if (!musicEnabled) return;
+        const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+        if (roomsState && roomsState.room && !roomsState.isAdmin) {
+          // Non-admin clients must not auto-start BGM; preload only
+          try { if (ASSETS && ASSETS.bgm) { preloadSfx('bgm', ASSETS.bgm).catch(()=>{}); } } catch(e){}
+          return;
         }
-        
-        const inst = new Audio(bgmUrl);
-        inst.loop = true;
-        inst.volume = 0.5; // Lower volume
-        inst.play().then(() => {
-          console.log('Started BGM via HTMLAudio');
-          bgmAudio = inst;
-          soundPool.bgm = inst;
-        }).catch((e) => {
-          console.warn('HTMLAudio BGM play failed:', e);
-        });
-      } catch(e) {
-        console.warn('HTMLAudio BGM creation failed:', e);
+
+        // fallback: attempt existing start strategies
+        try {
+          // stop previous audio
+          try { stopAllAudio(); } catch(e){}
+          const url = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : null;
+          if (!url) return;
+          // prefer decoded buffer
+          if (sfxBuffers && sfxBuffers['bgm']) {
+            try {
+              const ctx = ensureAudioCtx();
+              if (ctx) {
+                stopDecodedBgm();
+                const src = ctx.createBufferSource();
+                src.buffer = sfxBuffers['bgm'];
+                src.loop = true;
+                const g = ctx.createGain();
+                g.gain.value = 0.5;
+                src.connect(g);
+                g.connect(ctx.destination);
+                src.start(0);
+                decodedBgmNode = { source: src, gain: g, url };
+                decodedBgmPlaying = true;
+                return;
+              }
+            } catch(e){}
+          }
+          // SimpleAudio fallback
+          const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
+          if (sa && sa.unlocked) {
+            try { sa.stopBgm(); sa.map.bgm = url; sa.playBgm('bgm', 0.6); return; } catch(e){}
+          }
+          // HTMLAudio fallback
+          try {
+            const inst = new Audio(url);
+            inst.loop = true;
+            inst.volume = 0.5;
+            inst.play().then(()=>{ bgmAudio = inst; soundPool.bgm = inst; }).catch(()=>{});
+          } catch(e){}
+        } catch(e){ console.warn('Legacy BGM fallback failed', e); }
+        return;
       }
-      return;
-    }
 
     // SFX handling with proper cooldowns AND DURATION LIMITING
     const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -5534,7 +5707,19 @@ syncMusicCheckboxes(musicEnabled);
 // Enhanced BGM switching - completely stop all audio before switching
 function stopAllAudio() {
   console.log('Stopping all audio sources...');
-  
+
+  // Stop AudioManager BGM if present (highest-level manager)
+  try {
+    if (window.AUDIO && typeof window.AUDIO.stopBgm === 'function') {
+      try {
+        window.AUDIO.stopBgm();
+        console.log('Stopped AudioManager BGM');
+      } catch (e) {
+        console.warn('AudioManager stopBgm failed:', e);
+      }
+    }
+  } catch (e) { /* ignore */ }
+
   // Stop ALL HTMLAudio instances that might be playing BGM
   try { 
     if (bgmAudio) { 
@@ -5549,7 +5734,7 @@ function stopAllAudio() {
       
       bgmAudio.src = ''; 
       bgmAudio.removeAttribute('src');
-      bgmAudio.load(); // Force reload to clear any cached audio
+      try { bgmAudio.load(); } catch(e){}
       bgmAudio = null; 
     } 
   } catch(e){ console.warn('HTMLAudio BGM stop failed:', e); }
@@ -5558,14 +5743,16 @@ function stopAllAudio() {
   try {
     const allAudio = document.querySelectorAll('audio');
     for (const audio of allAudio) {
-      if (!audio.paused) {
-        console.log('Stopping stray audio element:', audio.src);
-        audio.pause();
-        audio.currentTime = 0;
-        audio.src = '';
-        audio.removeAttribute('src');
-        audio.load(); // Force clear audio buffer
-      }
+      try {
+        if (!audio.paused) {
+          console.log('Stopping stray audio element:', audio.src);
+          audio.pause();
+          audio.currentTime = 0;
+        }
+        // clear src to free network handles / blobs
+        try { audio.src = ''; audio.removeAttribute('src'); } catch(e){}
+        try { audio.load(); } catch(e){}
+      } catch (innerE) { /* ignore individual audio stop failures */ }
     }
   } catch(e){}
   
@@ -5578,11 +5765,13 @@ function stopAllAudio() {
   // Stop SimpleAudio BGM
   try { 
     if (window.__handNinja && window.__handNinja._simpleAudio) {
-      window.__handNinja._simpleAudio.stopBgm();
-      // Also clear the BGM instance completely
-      window.__handNinja._simpleAudio.bgm = null;
-      window.__handNinja._simpleAudio.bgmKey = null;
-      console.log('Stopped SimpleAudio BGM');
+      try {
+        window.__handNinja._simpleAudio.stopBgm();
+        // Also clear the BGM instance completely
+        window.__handNinja._simpleAudio.bgm = null;
+        window.__handNinja._simpleAudio.bgmKey = null;
+        console.log('Stopped SimpleAudio BGM');
+      } catch (e) { console.warn('SimpleAudio stopBgm inner failed:', e); }
     } 
   } catch(e){ console.warn('SimpleAudio BGM stop failed:', e); }
   
@@ -5608,83 +5797,56 @@ function stopAllAudio() {
     decodedBgmUrl = null;
     decodedBgmPlaying = false;
   } catch(e){}
-  
+
   console.log('All audio sources stopped');
 }
 
  // Centralized BGM system - safer behavior around rooms and joins
 function updateGameBGM(newGameId, { force = false } = {}) {
-  const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-  const inRoom = roomsState && roomsState.room;
-  const isAdmin = roomsState && roomsState.isAdmin;
-  console.log(`Updating BGM for game: ${newGameId} (force=${!!force})`);
-
-  // Decide whether we should teardown current playback.
-  // Teardown/start only when solo, when we're the admin, or when explicitly forced.
-  const shouldTeardown = (!inRoom) || isAdmin || !!force;
-
-  if (shouldTeardown) {
-    try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed in updateGameBGM', e); }
-  } else {
-    console.log('In-room non-admin — updating BGM asset mapping only (no teardown/start)');
-  }
-
+  console.log(`updateGameBGM -> ${newGameId} (force=${!!force})`);
   // Map game id to asset URL
   let newBgm = null;
-  if (newGameId === 'ninja-fruit') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
-  } else if (newGameId === 'paint-air') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3';
-  } else if (newGameId === 'shape-trace') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3';
-  } else if (newGameId === 'runner-control') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3';
-  } else if (newGameId === 'maze-mini') {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3';
-  } else {
-    newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
-  }
+  if (newGameId === 'ninja-fruit') newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
+  else if (newGameId === 'paint-air') newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_paint_loop.mp3';
+  else if (newGameId === 'shape-trace') newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_shape_loop.mp3';
+  else if (newGameId === 'runner-control') newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_runner_loop.mp3';
+  else if (newGameId === 'maze-mini') newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm_maze_loop.mp3';
+  else newBgm = 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
 
   ASSETS.bgm = newBgm;
-  console.log(`BGM asset updated to: ${newBgm} for game: ${newGameId}`);
+  try { if (window.__handNinja && window.__handNinja._simpleAudio) window.__handNinja._simpleAudio.map.bgm = newBgm; } catch(e){}
 
-  // Update SimpleAudio mapping (do not forcibly play)
-  if (window.__handNinja && window.__handNinja._simpleAudio) {
-    window.__handNinja._simpleAudio.map.bgm = newBgm;
-    if (shouldTeardown && window.__handNinja._simpleAudio.buff && window.__handNinja._simpleAudio.buff.bgm) {
-      delete window.__handNinja._simpleAudio.buff.bgm;
+  // Inform musicController about the new BGM and let it decide whether to preload/start/stop.
+  try {
+    const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
+    if (mc) {
+      // update local room/admin state from ROOMS_UI if available
+      const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+      mc.setRoomState({ inRoom: !!(roomsState && roomsState.room), isAdmin: !!(roomsState && roomsState.isAdmin) });
+      // preload the new asset
+      mc.preload(newBgm).catch(()=>{});
+      // decide start: only force start for solo/admin/explicit force
+      if (force) {
+        if (musicEnabled) mc.start(newBgm, { force: true });
+      } else {
+        // start only if allowed (solo/admin) and user has music enabled
+        const state = mc.getState ? mc.getState() : null;
+        const allowed = !(roomsState && roomsState.room) || (roomsState && roomsState.isAdmin);
+        if (musicEnabled && allowed) {
+          // slight delay to allow teardown to finish
+          setTimeout(() => { try { mc.start(newBgm, { force: false }); } catch(e){} }, 180);
+        }
+      }
+    } else {
+      // fallback to legacy behavior: stop if forced/solo/admin then try playSound
+      const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+      const inRoom = roomsState && roomsState.room;
+      const isAdmin = roomsState && roomsState.isAdmin;
+      const shouldTeardown = (!inRoom) || isAdmin || !!force;
+      if (shouldTeardown) try { stopAllAudio(); } catch(e){}
+      if (musicEnabled && shouldTeardown) setTimeout(()=>{ try{ playSound('bgm'); }catch(e){} }, 250);
     }
-    window.__handNinja._simpleAudio.bgm = null;
-    window.__handNinja._simpleAudio.bgmKey = null;
-  }
-
-  // Clear local caches when we performed teardown
-  if (shouldTeardown) {
-    try { if (soundPool && soundPool.bgm) delete soundPool.bgm; } catch(e){}
-    try { if (sfxBuffers && sfxBuffers['bgm']) delete sfxBuffers['bgm']; } catch(e){}
-    decodedBgm = null;
-    decodedBgmUrl = null;
-    decodedBgmPlaying = false;
-  } else {
-    // Non-admin in-room: attempt to preload the asset in background but don't interrupt playback
-    try {
-      (async () => {
-        try {
-          await preloadAssets().catch(()=>{});
-          await ensureDecodedSfxAll().catch(()=>{});
-          if (ASSETS && ASSETS.bgm) await decodeBgmBuffer(ASSETS.bgm).catch(()=>{});
-        } catch(e) {}
-      })();
-    } catch(e){}
-  }
-
-  // Only start music automatically if we actually tore down (solo/admin/forced) and user allows music.
-  if (musicEnabled && shouldTeardown) {
-    console.log('Starting new BGM due to update (solo/admin/forced)');
-    setTimeout(() => {
-      try { playSound('bgm'); } catch(e){ console.warn('Failed to start new BGM:', e); }
-    }, 250);
-  }
+  } catch(e){ console.warn('updateGameBGM failed', e); }
 }
 
 // Enhanced game selector with centralized BGM control
@@ -5761,6 +5923,22 @@ if (window.NET) {
         // Show "waiting" overlay while we preload and warm camera/audio
         showWaitingForPlayersOverlay(true, 'Preparing your client — loading assets and hand tracking');
 
+        // Notify server immediately that client is ready for authoritative begin (do not wait for warm tasks)
+        const readyPayload = {
+          game: (data && data.game) ? data.game : currentGameId,
+          timeLimit: (data && typeof data.timeLimit === 'number') ? data.timeLimit : Number(gameLengthEl.value || 45),
+          name: (playerNameEl && playerNameEl.value) ? String(playerNameEl.value).slice(0,24) : undefined
+        };
+        try {
+          if (typeof NET.sendClientReady === 'function') {
+            NET.sendClientReady(readyPayload);
+          } else if (NET.socket && typeof NET.socket.emit === 'function') {
+            NET.socket.emit('client_ready', readyPayload);
+          } else if (typeof NET.send === 'function') {
+            NET.send('client_ready', readyPayload);
+          }
+        } catch (e) { console.warn('Failed to notify server of readiness (early)', e); }
+
         // Start background preload + warm tasks (non-blocking)
         (async () => {
           try {
@@ -5768,38 +5946,16 @@ if (window.NET) {
             await warmCameraWithMediaPipe().catch(()=>{});
             // ensure AudioContext exists
             ensureAudioCtx();
-            // preload assets and decode important SFX/BGM
-            await preloadAssets().catch(()=>{});
-            await ensureDecodedSfxAll().catch(()=>{});
+            // Kick off preload & decode tasks but do NOT await them here to avoid blocking UI / join flow.
+            // This reduces the chance of long blocking waits (fetch/decode) causing a black screen delay.
+            preloadAssets().catch(()=>{});
+            ensureDecodedSfxAll().catch(()=>{});
             if (ASSETS && ASSETS.bgm) {
-              await decodeBgmBuffer(ASSETS.bgm).catch(()=>{});
+              // decode in background (best-effort)
+              decodeBgmBuffer(ASSETS.bgm).catch(()=>{});
             }
           } catch (e) {
             console.warn('Preload/warm tasks failed', e);
-          } finally {
-            // Notify server we are ready for authoritative begin
-            const readyPayload = {
-              game: (data && data.game) ? data.game : currentGameId,
-              timeLimit: (data && typeof data.timeLimit === 'number') ? data.timeLimit : Number(gameLengthEl.value || 45),
-              name: (playerNameEl && playerNameEl.value) ? String(playerNameEl.value).slice(0,24) : undefined
-            };
-            try {
-              if (typeof NET.sendClientReady === 'function') {
-                NET.sendClientReady(readyPayload);
-              } else if (NET.socket && typeof NET.socket.emit === 'function') {
-                NET.socket.emit('client_ready', readyPayload);
-              } else if (typeof NET.send === 'function') {
-                NET.send('client_ready', readyPayload);
-              } else {
-                // best-effort generic: call NET.startRoomGame with ready flag if available
-                if (typeof NET.startRoomGame === 'function') {
-                  // do not actually start; just inform server via a convention if implemented
-                  try { NET.startRoomGame({ ready: true }); } catch(e){}
-                }
-              }
-            } catch (e) {
-              console.warn('Failed to notify server of readiness', e);
-            }
           }
         })();
 
@@ -5857,9 +6013,14 @@ if (window.NET) {
           try {
             console.log(`Initializing synchronized game state for ${currentGameId}`);
             
-            // Clear canvas to prevent black screen
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, canvas.width / DPR, canvas.height / DPR);
+            // Only clear to black when the camera/video is not producing frames yet.
+            // Clearing unconditionally can produce a visible black screen while the camera warms up.
+            try {
+              if (!videoEl || (typeof videoEl.readyState === 'undefined') || videoEl.readyState < 2) {
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, canvas.width / DPR, canvas.height / DPR);
+              }
+            } catch (e) { /* ignore canvas clear failures */ }
             
             // Reset all state
             score = 0;
@@ -5898,10 +6059,17 @@ if (window.NET) {
             lastFruitSpawn = startTime;
             lastBombSpawn = startTime;
             
-            // Start BGM if enabled
-            if (musicEnabled && ASSETS && ASSETS.bgm) {
-              try { playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true }); } catch(e){ try { playSound('bgm'); } catch(e){} }
-            }
+            // Start BGM per music controller policy (admin vs non-admin / server-forced)
+            try {
+              const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
+              if (mc && typeof mc.onGameBegin === 'function') {
+                mc.onGameBegin(data);
+              } else {
+                if (musicEnabled && ASSETS && ASSETS.bgm) {
+                  try { playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true }); } catch(e){ try { playSound('bgm'); } catch(e){} }
+                }
+              }
+            } catch (e) { console.warn('BGM start on game_begin failed', e); }
             
             running = true;
             menuEl.style.display = 'none';
@@ -6450,8 +6618,59 @@ window.__handNinja = {
     unlockBtn.title = 'Mark a user gesture to unlock audio';
     unlockBtn.style.flex = '1';
     unlockBtn.onclick = function() { try { window.__handNinja._userInteracted = true; if (window.__handNinja._simpleAudio && typeof window.__handNinja._simpleAudio.initOnFirstInteraction === 'function') window.__handNinja._simpleAudio.initOnFirstInteraction(); } catch(e){} };
+
+    // Stop / Dump controls for quick debugging of audio state
+    const stopBtn = document.createElement('button');
+    stopBtn.textContent = 'Stop All';
+    stopBtn.title = 'Stop all audio sources (decoded, HTMLAudio, SimpleAudio)';
+    stopBtn.style.flex = '1';
+    stopBtn.onclick = function() {
+      try {
+        stopAllAudio();
+        const msg = 'stopAllAudio() invoked';
+        try { console.info && console.info(msg); } catch(e){}
+        // also provide immediate visual feedback by inserting a short log line
+        const stamp = document.createElement('div');
+        stamp.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        stamp.style.fontSize = '12px';
+        stamp.style.opacity = '0.9';
+        list && list.insertBefore(stamp, list.firstChild);
+      } catch(e){}
+    };
+
+    const dumpBtn = document.createElement('button');
+    dumpBtn.textContent = 'Dump';
+    dumpBtn.title = 'Dump current audio debug status';
+    dumpBtn.style.flex = '1';
+    dumpBtn.onclick = function() {
+      try {
+        const state = {
+          decodedBgmPlaying: !!decodedBgmPlaying,
+          decodedBgmUrl: decodedBgmUrl || null,
+          bgmAudioSrc: (bgmAudio && bgmAudio.src) ? bgmAudio.src : null,
+          simpleAudioBgmKey: (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio.bgmKey || null : null,
+          soundPoolBgm: (soundPool && soundPool.bgm && soundPool.bgm.src) ? soundPool.bgm.src : null,
+          sfxBuffersKeys: Object.keys(sfxBuffers || {}),
+          musicControllerState: (window.__handNinja && window.__handNinja.musicController && typeof window.__handNinja.musicController.getState === 'function') ? window.__handNinja.musicController.getState() : null
+        };
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(state, null, 2);
+        pre.style.background = 'rgba(255,255,255,0.02)';
+        pre.style.color = '#dfefff';
+        pre.style.padding = '8px';
+        pre.style.borderRadius = '6px';
+        pre.style.marginTop = '8px';
+        pre.style.maxHeight = '200px';
+        pre.style.overflow = 'auto';
+        list && list.insertBefore(pre, list.firstChild);
+        try { console.debug && console.debug('Audio debug dump', state); } catch(e){}
+      } catch(e){}
+    };
+
     ctrlRow.appendChild(preloadBtn);
     ctrlRow.appendChild(unlockBtn);
+    ctrlRow.appendChild(stopBtn);
+    ctrlRow.appendChild(dumpBtn);
     panel.appendChild(ctrlRow);
 
     const list = document.createElement('div');
