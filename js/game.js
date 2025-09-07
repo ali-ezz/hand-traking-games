@@ -850,6 +850,11 @@ const mazeModule = (function(){
     const actualW = w;
     const actualH = h;
 
+    // Prefer a landscape-first logical grid on touch/mobile devices when the viewport is portrait.
+    // This makes the maze appear horizontally-oriented on phones held in portrait by generating
+    // the grid as if the device were in landscape, then scaling/centering it in the canvas.
+    const isTouchDevice = (typeof window !== 'undefined') && (('ontouchstart' in window) || (navigator && navigator.maxTouchPoints > 0));
+
     // Allow opt-in override via window.__handNinja flags (useful for testing).
 const useLogical = (window.__handNinja && typeof window.__handNinja.forceLogicalMaze !== 'undefined')
   ? !!window.__handNinja.forceLogicalMaze
@@ -858,8 +863,23 @@ const useLogical = (window.__handNinja && typeof window.__handNinja.forceLogical
     const LOGICAL_MAZE_W = (window.__handNinja && window.__handNinja.logicalMazeWidth) || 800;
     const LOGICAL_MAZE_H = (window.__handNinja && window.__handNinja.logicalMazeHeight) || 480;
 
-    const logicalW = useLogical ? LOGICAL_MAZE_W : actualW;
-    const logicalH = useLogical ? LOGICAL_MAZE_H : actualH;
+    // Start with sensible defaults (either forced logical or actual canvas dims).
+    let logicalW = useLogical ? LOGICAL_MAZE_W : actualW;
+    let logicalH = useLogical ? LOGICAL_MAZE_H : actualH;
+
+    // When on a touch device in portrait orientation and not forcing a logical size,
+    // swap to a landscape-first logical sizing so cols/rows compute as a wider layout.
+    if (isTouchDevice && actualH > actualW && !useLogical) {
+      logicalW = Math.max(actualW, actualH);
+      logicalH = Math.min(actualW, actualH);
+      // gentle UX hint encouraging landscape rotation (non-blocking)
+      try {
+        if (typeof noticeEl !== 'undefined' && noticeEl) {
+          noticeEl.textContent = 'Rotate device for best maze experience — landscape preferred';
+          setTimeout(()=> { try { noticeEl.textContent = ''; } catch(e){} }, 1600);
+        }
+      } catch(e){}
+    }
 
     // compute grid based on logical size to keep maze deterministic across devices
     cols = Math.max(3, Math.floor(logicalW / 120));
@@ -1327,6 +1347,21 @@ window.__handNinja.musicController = (function() {
   async function _playUrl(url, vol = 0.7, { loop = true } = {}) {
     try {
       if (!url) return false;
+      // Avoid duplicate playback attempts for the same URL when we already believe it's playing.
+      // This helps prevent double-start when multiple server events (music_play / game_begin)
+      // arrive in quick succession. Also use a transient `starting` flag to reduce the race
+      // window where two concurrent callers might both pass the playing check.
+      try {
+        if (state.playing && state.url && url && (String(state.url) === String(url))) {
+          return true;
+        }
+        if (state.starting && state.url && url && (String(state.url) === String(url))) {
+          // Another start is in-flight for the same URL; treat as success.
+          return true;
+        }
+        // mark that we're attempting to start this URL so concurrent callers will observe `state.starting`
+        state.starting = true;
+      } catch (e) { /* ignore guard failures */ }
       // Try decoded WebAudio buffer
       if (sfxBuffers && sfxBuffers['bgm']) {
         try {
@@ -1366,6 +1401,9 @@ window.__handNinja.musicController = (function() {
     } catch (e) {
       console.warn('musicController _playUrl failed', e);
       return false;
+    } finally {
+      // clear transient starting flag to allow subsequent starts
+      try { if (state && state.starting) delete state.starting; } catch (e) {}
     }
   }
 
@@ -1380,6 +1418,24 @@ window.__handNinja.musicController = (function() {
       // preload but do not autoplay
       await preload(u).catch(()=>{});
       state.playing = false;
+      // Debugging: surface why playback was blocked (console + optional debug panel + brief notice)
+      try {
+        console.warn('musicController.start blocked autoplay: inRoom && !isAdmin && !force', { url: u, inRoom: state.inRoom, isAdmin: state.isAdmin, force });
+        const panel = (typeof document !== 'undefined') ? document.getElementById('audioDebugPanel') : null;
+        if (panel) {
+          const entry = document.createElement('div');
+          entry.textContent = `[${new Date().toLocaleTimeString()}] BGM blocked (room/non-admin)`;
+          entry.style.fontSize = '12px';
+          entry.style.marginTop = '6px';
+          panel.insertBefore(entry, panel.firstChild);
+        }
+        // Non-intrusive user hint
+        if (typeof noticeEl !== 'undefined' && noticeEl) {
+          const prev = noticeEl.textContent;
+          try { noticeEl.textContent = 'Music withheld by room settings (admin can force) — tap to enable'; } catch(e){}
+          setTimeout(()=> { try { noticeEl.textContent = prev; } catch(e){} }, 2200);
+        }
+      } catch(e){}
       return false;
     }
     // Ensure audio context exists for decoded playback

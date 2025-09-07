@@ -149,6 +149,7 @@ task_progress
     </div>
 
     <div id="ui" style="z-index:20; display:flex; align-items:center; gap:8px;">
+    <script src="js/audio-debug.js"></script>
       <div class="score" id="score">Score: 0</div>
       <div class="score" id="timer" style="margin-left:8px">Time: 0</div>
       <div class="score" id="roomHighScore" style="margin-left:8px; display:none;">Best: ?</div>
@@ -176,6 +177,15 @@ task_progress
     </div>
 
     <div id="notice">Allow camera access. Use your hand to slice fruits.</div>
+
+    <!-- Audio debug panel: shown when autoplay is blocked; populated by js/audio-debug.js -->
+    <div id="audioDebugPanel" aria-hidden="true" style="position:fixed; right:12px; bottom:12px; z-index:9999; background:rgba(0,0,0,0.85); color:#fff; padding:10px; border-radius:10px; max-width:320px; font-size:13px; display:none;">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
+        <strong style="font-size:13px; margin:0;">Audio</strong>
+        <button id="audioDebugClose" class="btn" style="padding:4px 8px; font-size:12px;">Close</button>
+      </div>
+      <div id="audioDebugEntries" style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto;"></div>
+    </div>
 
     <!-- Leaderboard modal -->
     <div id="leaderboard" style="position:fixed; z-index:10000; top:50%; left:50%; transform:translate(-50%, -50%); display:none; pointer-events:auto; max-width:90vw; max-height:90vh;">

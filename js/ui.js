@@ -1033,6 +1033,41 @@ Purpose:
     renderRooms
   };
 
+  // When autoplay is blocked for in-room non-admins, surface a short note in the room UI
+  try {
+    if (typeof document !== 'undefined') {
+      document.addEventListener('bgm:blocked', function(ev) {
+        try {
+          const detail = (ev && ev.detail) ? ev.detail : {};
+          // Only act for blocked-in-room, non-admin situations
+          if (!detail.inRoom || detail.isAdmin) return;
+          const info = (typeof ensureRoomInfoEl === 'function') ? ensureRoomInfoEl() : null;
+          if (!info) return;
+          const wait = info.querySelector('.rooms-waiting-panel');
+          if (wait) {
+            try {
+              wait.textContent = 'Music withheld by room settings — admin can force music. Use the Audio panel to enable for this client.';
+              wait.style.display = 'block';
+            } catch(e){}
+          }
+          // Add a compact hint to the small bar
+          try {
+            let hint = smallBar.querySelector('.rooms-music-hint');
+            if (!hint) {
+              hint = document.createElement('span');
+              hint.className = 'rooms-music-hint rooms-muted';
+              hint.style.marginLeft = '8px';
+              const ref = smallBar.querySelector('.rooms-copy-btn') || smallBar.firstChild;
+              if (ref && ref.parentNode) ref.parentNode.insertBefore(hint, ref);
+              else smallBar.appendChild(hint);
+            }
+            hint.textContent = 'music blocked';
+          } catch(e){}
+        } catch(e){}
+      }, false);
+    }
+  } catch(e){}
+
   // Update status periodically
   setInterval(() => {
     if (NET && NET.connected) setStatus('connected', 'green');

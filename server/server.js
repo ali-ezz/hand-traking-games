@@ -462,7 +462,7 @@ io.on('connection', (socket) => {
     });
     const bgmUrl = mapGameToBgm(room.game);
     room.bgmUrl = bgmUrl;
-    io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, items: gameItems, bgmUrl });
+    io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, items: gameItems, bgmUrl, forcePlayAll: true });
 
     // schedule authoritative game_begin at the startTs
     const __delay = Math.max(0, room.startTs - Date.now());
@@ -474,11 +474,12 @@ io.on('connection', (socket) => {
           startTime: room.startTs,
           seed,
           items: room.gameItems || gameItems,
-          bgmUrl: room.bgmUrl || mapGameToBgm(room.game)
+          bgmUrl: room.bgmUrl || mapGameToBgm(room.game),
+          forcePlayAll: true
         });
         // Instruct all clients to start the shared room BGM when the game begins.
         try {
-            io.to(roomId).emit('music_play', { bgmUrl: room.bgmUrl || mapGameToBgm(room.game) });
+            io.to(roomId).emit('music_play', { bgmUrl: room.bgmUrl || mapGameToBgm(room.game), forcePlayAll: true });
           } catch (e) {
             console.warn('Failed to emit music_play for room', roomId, e);
           }
@@ -499,7 +500,7 @@ io.on('connection', (socket) => {
         try { console.log(`room:${roomId} game ended (timeup) prevEndTs=${prevEndTs}`); } catch(e){}
         // Notify clients to stop shared room BGM when the game ends.
           try {
-          io.to(roomId).emit('music_stop', { reason: 'timeup', endTs: prevEndTs });
+          io.to(roomId).emit('music_stop', { reason: 'timeup', endTs: prevEndTs, forceStopAll: true });
         } catch (e) {
           console.warn('Failed to emit music_stop for room', roomId, e);
         }
@@ -544,7 +545,7 @@ io.on('connection', (socket) => {
 
     // Instruct clients to stop shared room BGM when admin stops the game early.
     try {
-      io.to(roomId).emit('music_stop', { reason: 'stopped', endTs: prevEnd });
+      io.to(roomId).emit('music_stop', { reason: 'stopped', endTs: prevEnd, forceStopAll: true });
     } catch (e) {
       console.warn('Failed to emit music_stop for room stop', roomId, e);
     }
