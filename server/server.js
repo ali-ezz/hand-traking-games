@@ -85,203 +85,9 @@ app.post('/leaderboard', (req, res) => {
 
 // In-memory room manager and state caches
 const rooms = Object.create(null);
-// rooms[roomId] = { id, public, players: Map(socketId->meta), createdAt, cleanupTimer, admin, game, status, timeLimit, startTs, endTs, gameState, scores }
+// rooms[roomId] = { id, public, players: Map(socketId->meta), createdAt, cleanupTimer, admin, game, status, timeLimit, startTs, endTs }
 
-// Keep last-known state per socket to let newcomers see peers immediately
-const lastHandBySocket = new Map(); // socketId -> { payload, name, ts }
-const lastPaintBySocket = new Map(); // socketId -> { payload, name, ts }
-
-// Game state generation utilities
-function generateGameState(gameId, seed) {
-  // Use deterministic RNG for reproducible game state
-  const rng = mulberry32(seed);
-
-  const gameState = {
-    seed: seed,
-    objects: [],
-    spawnPatterns: [],
-    gameId: gameId,
-    generatedAt: Date.now()
-  };
-
-  if (gameId === 'ninja-fruit') {
-    // Generate fruits and bombs with deterministic patterns
-    const fruitCount = 15 + Math.floor(rng() * 10); // 15-25 fruits
-    const bombCount = 3 + Math.floor(rng() * 3); // 3-6 bombs
-
-    // Generate spawn positions deterministically
-    for (let i = 0; i < fruitCount; i++) {
-      const x = 50 + rng() * 700; // Spread across canvas width
-      const y = -50 - rng() * 200; // Start above screen
-      const vx = (rng() - 0.5) * 400; // Random horizontal velocity
-      const vy = 800 + rng() * 600; // Strong upward throw
-      const color = `hsl(${Math.floor(rng() * 360)},70%,55%)`;
-
-      gameState.objects.push({
-        id: `fruit_${i}`,
-        type: 'fruit',
-        x, y, vx, vy,
-        r: 20 + rng() * 14,
-        color,
-        sliced: false
-      });
-    }
-
-    for (let i = 0; i < bombCount; i++) {
-      const x = 50 + rng() * 700;
-      const y = -50 - rng() * 200;
-      const vx = (rng() - 0.5) * 300;
-      const vy = 800 + rng() * 600;
-
-      gameState.objects.push({
-        id: `bomb_${i}`,
-        type: 'bomb',
-        x, y, vx, vy,
-        r: 18 + rng() * 8,
-        color: '#111',
-        sliced: false
-      });
-    }
-
-    // Generate spawn timing patterns
-    gameState.spawnPatterns = {
-      fruitInterval: 1200 + rng() * 800,
-      bombInterval: 4000 + rng() * 2000,
-      maxFruits: 6,
-      maxBombs: 2
-    };
-
-  } else if (gameId === 'shape-trace') {
-    // Generate a deterministic shape for all players
-    const shapes = ['circle', 'triangle', 'square', 'star', 'heart'];
-    const selectedShape = shapes[Math.floor(rng() * shapes.length)];
-
-    gameState.shape = {
-      type: selectedShape,
-      points: generateShapePoints(selectedShape, rng),
-      tolerance: 60 + rng() * 40
-    };
-
-  } else if (gameId === 'maze-mini') {
-    // Generate deterministic maze
-    gameState.maze = generateMaze(rng);
-
-  } else if (gameId === 'runner-control') {
-    // Generate obstacle patterns
-    gameState.obstacles = [];
-    for (let i = 0; i < 20; i++) {
-      gameState.obstacles.push({
-        id: `obs_${i}`,
-        x: 800 + i * 300 + rng() * 200,
-        y: 200 + rng() * 200,
-        width: 32,
-        height: 80 + rng() * 40,
-        speed: 200 + rng() * 50
-      });
-    }
-  }
-
-  return gameState;
-}
-
-function generateShapePoints(type, rng) {
-  const points = [];
-  const centerX = 400;
-  const centerY = 300;
-  const radius = 100 + rng() * 50;
-
-  if (type === 'circle') {
-    const segments = 24;
-    for (let i = 0; i <= segments; i++) {
-      const angle = (i / segments) * Math.PI * 2;
-      points.push({
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius
-      });
-    }
-  } else if (type === 'triangle') {
-    for (let i = 0; i <= 3; i++) {
-      const angle = (i / 3) * Math.PI * 2;
-      points.push({
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius
-      });
-    }
-  } else if (type === 'square') {
-    const size = radius * 0.7;
-    points.push({ x: centerX - size, y: centerY - size });
-    points.push({ x: centerX + size, y: centerY - size });
-    points.push({ x: centerX + size, y: centerY + size });
-    points.push({ x: centerX - size, y: centerY + size });
-    points.push({ x: centerX - size, y: centerY - size }); // close
-  }
-
-  return points;
-}
-
-function generateMaze(rng) {
-  const cols = 8 + Math.floor(rng() * 4); // 8-12 columns
-  const rows = 6 + Math.floor(rng() * 3); // 6-9 rows
-  const cellSize = 60;
-
-  // Simple maze generation using randomized DFS
-  const cells = new Array(cols * rows).fill().map(() => ({
-    walls: [true, true, true, true], // top, right, bottom, left
-    visited: false
-  }));
-
-  const stack = [];
-  const startIdx = Math.floor(rng() * cols);
-  cells[startIdx].visited = true;
-  stack.push(startIdx);
-
-  while (stack.length > 0) {
-    const current = stack[stack.length - 1];
-    const neighbors = [];
-
-    // Check all 4 directions
-    const dirs = [
-      { dir: 0, dx: 0, dy: -1 }, // top
-      { dir: 1, dx: 1, dy: 0 },  // right
-      { dir: 2, dx: 0, dy: 1 },  // bottom
-      { dir: 3, dx: -1, dy: 0 }  // left
-    ];
-
-    for (const { dir, dx, dy } of dirs) {
-      const nx = (current % cols) + dx;
-      const ny = Math.floor(current / cols) + dy;
-      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
-        const neighborIdx = ny * cols + nx;
-        if (!cells[neighborIdx].visited) {
-          neighbors.push({ idx: neighborIdx, dir, oppositeDir: (dir + 2) % 4 });
-        }
-      }
-    }
-
-    if (neighbors.length > 0) {
-      const chosen = neighbors[Math.floor(rng() * neighbors.length)];
-      cells[current].walls[chosen.dir] = false;
-      cells[chosen.idx].walls[chosen.oppositeDir] = false;
-      cells[chosen.idx].visited = true;
-      stack.push(chosen.idx);
-    } else {
-      stack.pop();
-    }
-  }
-
-  return { cols, rows, cellSize, cells };
-}
-
-// Mulberry32 PRNG for deterministic game state generation
-function mulberry32(a) {
-  return function() {
-    a |= 0;
-    a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+ // Peer streaming and per-socket state caching removed for simplified admin-only model.
 
 function createRoom({ id, isPublic }) {
   let roomId = id && String(id).trim() ? String(id).trim() : nanoid(ROOM_ID_SIZE);
@@ -300,7 +106,9 @@ function createRoom({ id, isPublic }) {
     timeLimit: 60,
     status: 'waiting',
     startTs: null,
-    endTs: null
+    endTs: null,
+    // Track the room's all-time high score (name and score)
+    highScore: { name: null, score: 0 }
   };
   broadcastRoomList();
   return rooms[roomId];
@@ -400,6 +208,63 @@ function isValidPaintPayload(p) {
   return p.pts.every(pt => pt && typeof pt.x === 'number' && typeof pt.y === 'number');
 }
 
+// Generate a deterministic set of game items based on a seed
+function generateGameItems(gameType, seed) {
+  const items = [];
+
+  // Mulberry32 deterministic PRNG to match client-side generator for parity
+  function mulberry32(a) {
+    return function() {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const rng = mulberry32(seed >>> 0);
+
+  if (gameType === 'fruit' || gameType === 'ninja-fruit') {
+    const baseNumItems = 25 + Math.floor(rng() * 25); // 25-50 items (reduced for multiplayer)
+    const MAX_ITEMS = 30; // hard cap to reduce density in multiplayer rooms
+    const numItems = Math.min(baseNumItems, MAX_ITEMS);
+    try { console.log(`generateGameItems seed=${seed} baseNumItems=${baseNumItems} numItems=${numItems}`); } catch(e){}
+    for (let i = 0; i < numItems; i++) {
+      items.push({
+        id: `item_${i}_${Date.now()}`,
+        type: rng() > 0.2 ? 'fruit' : 'bomb',
+        x: 0.1 + rng() * 0.8, // avoid edges
+        y: 1.1, // start offscreen top
+        velX: (rng() - 0.5) * 0.005,
+        velY: -0.015 - (rng() * 0.01), // move upwards initially
+        gravity: 0.00005,
+        spawnTime: Math.round(i * (100 + rng() * 400)) // Stagger spawn times (ms)
+      });
+    }
+  } else if (gameType === 'shape-trace' || gameType === 'paint-air' || gameType === 'runner-control' || gameType === 'maze-mini') {
+    // For non-physics games (shape-trace, paint-air, runner), generate minimal items
+    // These games don't need spawn items, but we create a dummy item for synchronization
+    items.push({
+      id: `sync_${seed}_${Date.now()}`,
+      type: 'sync',
+      x: 0.0,
+      y: 0.0,
+      velX: 0,
+      velY: 0,
+      gravity: 0,
+      spawnTime: 0
+    });
+  }
+  return items;
+}
+
+function mapGameToBgm(gameType) {
+  const mapping = { fruit: '/assets/bgm_maze_loop.mp3', default: '/assets/bgm.mp3' };
+  return mapping[gameType] || mapping.default;
+}
+
+
 // Socket.IO handlers
 io.on('connection', (socket) => {
   console.log('socket connected', socket.id);
@@ -444,25 +309,35 @@ io.on('connection', (socket) => {
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
 
-    // Immediately send existing peers' last known states to the newcomer
-    for (const [sid, meta] of room.players.entries()) {
-      if (sid === socket.id) continue;
-      const handState = lastHandBySocket.get(sid);
-      if (handState && handState.payload) {
-        try {
-          socket.emit('peer_hand', { id: sid, payload: handState.payload, name: handState.name || 'Player', ts: handState.ts || Date.now() });
-        } catch (e) {}
-      }
-      const paintState = lastPaintBySocket.get(sid);
-      if (paintState && paintState.payload) {
-        try {
-          socket.emit('peer_paint', { id: sid, payload: paintState.payload, name: paintState.name || 'Player', ts: paintState.ts || Date.now() });
-        } catch (e) {}
+
+    // If a run is active, send authoritative game state to the newcomer so they
+    // can join mid-run with the exact schedule and timings.
+    if (room.status === 'running') {
+      try {
+        const now = Date.now();
+        socket.emit('game_start', {
+          game: room.game,
+          timeLimit: room.timeLimit,
+          startTs: room.startTs,
+          endTs: room.endTs,
+          seed: typeof room.seed === 'number' ? room.seed : null,
+          items: Array.isArray(room.gameItems) ? room.gameItems : [],
+          forcePlayAll: !!room.forcePlayAll,
+          bgmUrl: room.bgmUrl
+        });
+          // If the authoritative start time already passed, also emit game_begin so client switches to authoritative mode.
+          if (now >= (room.startTs || 0)) {
+            socket.emit('game_begin', {
+              startTime: room.startTs,
+              seed: typeof room.seed === 'number' ? room.seed : null,
+              items: Array.isArray(room.gameItems) ? room.gameItems : [],
+              bgmUrl: room.bgmUrl
+            });
+          }
+      } catch (e) {
+        console.warn('Failed to send running game state to joiner', socket.id, e);
       }
     }
-
-    // Still request state as a fallback for older clients
-    socket.to(roomId).emit('peer_request_state', { requester: socket.id });
 
     // Respond to joiner's callback with list of peers
     const peers = [];
@@ -566,18 +441,14 @@ io.on('connection', (socket) => {
     const seed = Math.floor(Math.random() * 0x7fffffff);
     room.startTs = startTs;
     room.endTs = room.startTs + (room.timeLimit || 60) * 1000;
+    // Persist the seed so late joiners can deterministically reproduce the schedule
+    room.seed = seed;
 
-    // Generate deterministic game state for all clients
-    const gameState = generateGameState(room.game, seed);
-    room.gameState = gameState;
+    // Generate game items based on game type and seed
+    const gameItems = generateGameItems(room.game, seed);
+    room.gameItems = gameItems; // Store items in the room object
 
-    // Initialize per-player scores
-    room.scores = {};
-    for (const [playerId, playerMeta] of room.players.entries()) {
-      room.scores[playerId] = { score: 0, name: playerMeta.name };
-    }
-
-    try { console.log(`room:${roomId} starting game`, { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, requestedBy: socket.id, objectsCount: gameState.objects ? gameState.objects.length : 0 }); } catch(e){}
+    try { console.log(`room:${roomId} starting game`, { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, items: gameItems.length, requestedBy: socket.id }); } catch(e){}
 
     // emit updated room metadata and a game_start notification
     io.to(roomId).emit('room_update', {
@@ -589,13 +460,28 @@ io.on('connection', (socket) => {
       status: room.status,
       players: Array.from(room.players.entries()).map(([sid, meta]) => ({ id: sid, name: meta.name }))
     });
-    io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed });
+    const bgmUrl = mapGameToBgm(room.game);
+    room.bgmUrl = bgmUrl;
+    io.to(roomId).emit('game_start', { game: room.game, timeLimit: room.timeLimit, startTs: room.startTs, endTs: room.endTs, seed, items: gameItems, bgmUrl });
 
     // schedule authoritative game_begin at the startTs
     const __delay = Math.max(0, room.startTs - Date.now());
     room.beginTimer = setTimeout(() => {
       try {
-        io.to(roomId).emit('game_begin', { startTime: room.startTs, seed, gameState });
+        // Include authoritative scheduled items with the game_begin so non-admin clients
+        // receive the exact spawn schedule they must follow.
+        io.to(roomId).emit('game_begin', {
+          startTime: room.startTs,
+          seed,
+          items: room.gameItems || gameItems,
+          bgmUrl: room.bgmUrl || mapGameToBgm(room.game)
+        });
+        // Instruct all clients to start the shared room BGM when the game begins.
+        try {
+            io.to(roomId).emit('music_play', { bgmUrl: room.bgmUrl || mapGameToBgm(room.game) });
+          } catch (e) {
+            console.warn('Failed to emit music_play for room', roomId, e);
+          }
       } catch (e) { console.warn('Failed to emit game_begin for room', roomId, e); }
       room.beginTimer = null;
     }, __delay);
@@ -611,6 +497,12 @@ io.on('connection', (socket) => {
         room.endTs = null;
 
         try { console.log(`room:${roomId} game ended (timeup) prevEndTs=${prevEndTs}`); } catch(e){}
+        // Notify clients to stop shared room BGM when the game ends.
+          try {
+          io.to(roomId).emit('music_stop', { reason: 'timeup', endTs: prevEndTs });
+        } catch (e) {
+          console.warn('Failed to emit music_stop for room', roomId, e);
+        }
         io.to(roomId).emit('game_end', { reason: 'timeup', endTs: prevEndTs });
         io.to(roomId).emit('room_update', {
           id: room.id,
@@ -650,6 +542,12 @@ io.on('connection', (socket) => {
     room.startTs = null;
     room.endTs = null;
 
+    // Instruct clients to stop shared room BGM when admin stops the game early.
+    try {
+      io.to(roomId).emit('music_stop', { reason: 'stopped', endTs: prevEnd });
+    } catch (e) {
+      console.warn('Failed to emit music_stop for room stop', roomId, e);
+    }
     io.to(roomId).emit('game_end', { reason: 'stopped', endTs: prevEnd });
     io.to(roomId).emit('room_update', {
       id: room.id,
@@ -746,47 +644,109 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Hand frames: validate, cache last state, forward to peers
-  socket.on('hand', (payload) => {
+
+
+
+  socket.on('player_score', (payload, cb) => {
     try {
       const roomId = socket.data.roomId;
-      if (!roomId) return;
-      // debug log: received hand frame
-      try { console.debug && console.debug('server: recv hand', { socket: socket.id, room: roomId, hasPayload: !!payload }); } catch(e){}
-      const norm = payload || {};
-      if (!isValidHandPayload(norm)) {
-        // store minimal info so new joiners still see something
-        lastHandBySocket.set(socket.id, { payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-        try { console.debug && console.debug('server: saved invalid hand state for newcomer', { socket: socket.id, room: roomId }); } catch(e){}
+      if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+      const room = rooms[roomId];
+      if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      if (room.status !== 'running') { if (cb) cb({ ok: false, reason: 'not_running' }); return; }
+
+      const { score, name } = payload || {};
+      if (typeof score !== 'number') {
+        if (cb) cb({ ok: false, reason: 'invalid_score' });
         return;
       }
-      lastHandBySocket.set(socket.id, { payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-      // forward to everyone else in the same room
-      try { console.debug && console.debug('server: forward peer_hand', { from: socket.id, room: roomId }); } catch(e){}
-      socket.to(roomId).emit('peer_hand', { id: socket.id, payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-    } catch (e) {
-      console.warn('hand handler failed', e);
+
+      // Update room.highScore if this score is greater
+      room.highScore = room.highScore || { name: null, score: 0 };
+      if (score > (room.highScore.score || 0)) {
+        room.highScore = { name: (name || socket.data.displayName || 'Anonymous'), score, ts: Date.now() };
+        io.to(roomId).emit('room_highscore', { name: room.highScore.name, score: room.highScore.score });
+      }
+
+      // Still broadcast player's current score to the room
+      io.to(roomId).emit('peer_score', { id: socket.id, score });
+      if (cb) cb({ ok: true, highScore: room.highScore });
+
+    } catch (err) {
+      console.error('player_score handler err', err);
+      if (cb) cb({ ok: false, reason: 'error' });
     }
   });
 
-  // Paint frames: validate, cache last paint, forward to peers
-  socket.on('paint', (payload) => {
+  // Authoritative interaction handler
+  // Clients send interaction intents (e.g. slice/hit) to the server for validation.
+  // Server validates proximity to the authoritative item and, if accepted,
+  // marks the item removed and broadcasts object_state + peer_score updates.
+  socket.on('interaction', (payload, cb) => {
     try {
       const roomId = socket.data.roomId;
-      if (!roomId) return;
-      // debug log: received paint
-      try { console.debug && console.debug('server: recv paint', { socket: socket.id, room: roomId, ptsCount: Array.isArray(payload && payload.pts) ? payload.pts.length : 0 }); } catch(e){}
-      const norm = payload || {};
-      if (!isValidPaintPayload(norm)) {
-        lastPaintBySocket.set(socket.id, { payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-        try { console.debug && console.debug('server: saved invalid paint state for newcomer', { socket: socket.id, room: roomId }); } catch(e){}
+      if (!roomId) { if (cb) cb({ ok: false, reason: 'not_in_room' }); return; }
+      const room = rooms[roomId];
+      if (!room) { if (cb) cb({ ok: false, reason: 'not_found' }); return; }
+      if (room.status !== 'running') { if (cb) cb({ ok: false, reason: 'not_running' }); return; }
+
+      const { objectId, x, y } = payload || {};
+      if (!objectId) { if (cb) cb({ ok: false, reason: 'invalid_payload' }); return; }
+
+      room.objectStates = room.objectStates || {};
+      // find authoritative item if still present
+      const item = (room.gameItems || []).find(it => it && it.id === objectId);
+
+      // not found and not previously known as removed -> reject
+      if (!item && !(room.objectStates && room.objectStates[objectId])) {
+        if (cb) cb({ ok: false, reason: 'not_found' });
         return;
       }
-      lastPaintBySocket.set(socket.id, { payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-      try { console.debug && console.debug('server: forward peer_paint', { from: socket.id, room: roomId, ptsCount: norm.pts ? norm.pts.length : 0 }); } catch(e){}
-      socket.to(roomId).emit('peer_paint', { id: socket.id, payload: norm, name: socket.data.displayName || 'Player', ts: Date.now() });
-    } catch (e) {
-      try { socket.to(roomId).emit('peer_paint', { id: socket.id, payload, name: socket.data.displayName || 'Player' }); } catch(e){}
+
+      // already removed
+      if (room.objectStates[objectId] && room.objectStates[objectId].removed) {
+        if (cb) cb({ ok: false, reason: 'already_removed' });
+        return;
+      }
+
+      // Simple proximity validation if coordinates provided.
+      // Coordinates are expected normalized (0..1). Uses a conservative threshold.
+      let valid = true;
+      if (typeof x === 'number' && typeof y === 'number' && item && typeof item.x === 'number' && typeof item.y === 'number') {
+        const dx = x - item.x;
+        const dy = y - item.y;
+        const dist2 = dx * dx + dy * dy;
+        const thresh = 0.08; // tuned threshold for hit validation
+        if (dist2 > (thresh * thresh)) valid = false;
+      }
+
+      if (!valid) {
+        if (cb) cb({ ok: false, reason: 'miss' });
+        return;
+      }
+
+      // Mark removed in authoritative state
+      room.objectStates[objectId] = { removed: true, by: socket.id, ts: Date.now(), type: item ? item.type : 'unknown' };
+
+      // Maintain a simple per-room score table
+      room.scores = room.scores || {};
+      const delta = (item && item.type === 'bomb') ? -1 : 1;
+      room.scores[socket.id] = (room.scores[socket.id] || 0) + delta;
+
+      // Broadcast authoritative object state to all peers
+      try {
+        io.to(roomId).emit('object_state', { id: objectId, removed: true, by: socket.id, ts: room.objectStates[objectId].ts, type: room.objectStates[objectId].type });
+      } catch (e) {}
+
+      // Broadcast updated score for the player
+      try {
+        io.to(roomId).emit('peer_score', { id: socket.id, score: room.scores[socket.id] });
+      } catch (e) {}
+
+      if (cb) cb({ ok: true, removed: true, score: room.scores[socket.id] });
+    } catch (err) {
+      console.error('interaction handler err', err);
+      if (cb) cb({ ok: false, reason: 'error' });
     }
   });
 
@@ -797,79 +757,11 @@ io.on('connection', (socket) => {
         if (cb) cb({ ok: false, reason: 'invalid_score' });
         return;
       }
-
-      // Update room-specific scores if in a room
-      const roomId = socket.data.roomId;
-      if (roomId && rooms[roomId] && rooms[roomId].scores) {
-        rooms[roomId].scores[socket.id] = { score, name: socket.data.displayName || name };
-        // Broadcast score update to all room members
-        io.to(roomId).emit('score_update', {
-          playerId: socket.id,
-          score,
-          name: socket.data.displayName || name,
-          scores: rooms[roomId].scores
-        });
-      }
-
       const updated = postLeader(game, { name, score });
       if (cb) cb({ ok: true, leaders: updated });
       io.emit('leaderboard_update', { game, leaders: updated });
     } catch (err) {
       console.error('score handler err', err);
-      if (cb) cb({ ok: false, reason: 'error' });
-    }
-  });
-
-  // Handle object slicing/hit events for synchronization
-  socket.on('object_hit', (payload, cb) => {
-    try {
-      const roomId = socket.data.roomId;
-      if (!roomId || !rooms[roomId]) {
-        if (cb) cb({ ok: false, reason: 'not_in_room' });
-        return;
-      }
-
-      const room = rooms[roomId];
-      if (!room.gameState || !room.gameState.objects) {
-        if (cb) cb({ ok: false, reason: 'no_game_state' });
-        return;
-      }
-
-      const { objectId, hitType = 'slice', points = 10 } = payload || {};
-      if (!objectId) {
-        if (cb) cb({ ok: false, reason: 'missing_object_id' });
-        return;
-      }
-
-      // Find and mark object as sliced
-      const obj = room.gameState.objects.find(o => o.id === objectId);
-      if (obj && !obj.sliced) {
-        obj.sliced = true;
-        obj.slicedBy = socket.id;
-        obj.slicedAt = Date.now();
-
-        // Update player score
-        if (!room.scores[socket.id]) {
-          room.scores[socket.id] = { score: 0, name: socket.data.displayName || 'Player' };
-        }
-        room.scores[socket.id].score += points;
-
-        // Broadcast the hit to all clients
-        io.to(roomId).emit('object_hit', {
-          objectId,
-          hitType,
-          points,
-          playerId: socket.id,
-          playerName: socket.data.displayName || 'Player',
-          scores: room.scores
-        });
-
-        if (cb) cb({ ok: true, score: room.scores[socket.id].score });
-      } else {
-        if (cb) cb({ ok: false, reason: 'object_already_sliced' });
-      }
-    } catch (err) {
-      console.error('object_hit handler err', err);
       if (cb) cb({ ok: false, reason: 'error' });
     }
   });
@@ -911,8 +803,6 @@ io.on('connection', (socket) => {
     console.log('socket disconnected', socket.id);
     const roomId = socket.data.roomId;
     leaveRoom(socket);
-    lastHandBySocket.delete(socket.id);
-    lastPaintBySocket.delete(socket.id);
     if (roomId) socket.to(roomId).emit('peer_leave', { id: socket.id });
   });
 });

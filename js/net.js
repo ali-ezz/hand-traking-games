@@ -207,12 +207,67 @@ Notes:
           }
         } catch (e) {}
       });
+      // receive avatar updates forwarded by server
+      this.socket.on('peer_avatar', (data) => {
+        try { console.debug && console.debug('NET: recv peer_avatar', data); } catch(e){}
+        E.emit('peer_avatar', data);
+        // Also dispatch a DOM event so other modules loaded before NET can react.
+        try { 
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('net:peer_avatar', { detail: data }));
+          }
+        } catch (e) {}
+      });
       this.socket.on('leaderboard_update', (data) => { E.emit('leaderboard_update', data); });
 
       // room lifecycle / admin events
       this.socket.on('room_update', (data) => { E.emit('room_update', data); });
       this.socket.on('game_start', (data) => { E.emit('game_start', data); });
+      this.socket.on('game_begin', (data) => { E.emit('game_begin', data); });
       this.socket.on('game_end', (data) => { E.emit('game_end', data); });
+      this.socket.on('peer_score', (data) => { E.emit('peer_score', data); });
+      // Authoritative object state updates from server (e.g. removed items)
+      this.socket.on('object_state', (data) => {
+        try { console.debug && console.debug('NET: recv object_state', data); } catch(e){}
+        E.emit('object_state', data);
+        // Also dispatch DOM event for backward compatibility with modules listening on DOM
+        try {
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('net:object_state', { detail: data }));
+          }
+        } catch (err) {}
+      });
+
+      // Forward music control and room highscore events from server to local emitter
+      this.socket.on('music_play', (data) => {
+        try { console.debug && console.debug('NET: recv music_play', data); } catch(e){}
+        E.emit('music_play', data);
+        try {
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('net:music_play', { detail: data }));
+          }
+        } catch (err) {}
+      });
+
+      this.socket.on('music_stop', (data) => {
+        try { console.debug && console.debug('NET: recv music_stop', data); } catch(e){}
+        E.emit('music_stop', data);
+        try {
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('net:music_stop', { detail: data }));
+          }
+        } catch (err) {}
+      });
+
+      this.socket.on('room_highscore', (data) => {
+        try { console.debug && console.debug('NET: recv room_highscore', data); } catch(e){}
+        E.emit('room_highscore', data);
+        try {
+          if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('net:room_highscore', { detail: data }));
+          }
+        } catch (err) {}
+      });
 
       // server may request clients to immediately share their latest hand state (useful when a new peer joins)
       this.socket.on('peer_request_state', (data) => {
@@ -449,6 +504,70 @@ Notes:
       } catch (e) {}
     },
 
+    // Send interaction intents to server for authoritative validation.
+    // Payload: { objectId, x, y, meta? } where x,y are normalized coords (0..1).
+    sendInteraction(payload, cb) {
+      try {
+        if (!this.socket || this.connected === false) {
+          // best-effort queue for later delivery
+          this.pendingHandQueue = this.pendingHandQueue || [];
+          this.pendingHandQueue.push({ _interaction: true, payload });
+          if (this.pendingHandQueue.length > (this.pendingHandQueueMax || 200)) this.pendingHandQueue.shift();
+          if (cb) cb({ ok: false, reason: 'not_connected' });
+          return;
+        }
+        try { console.debug && console.debug('NET: sendInteraction()', payload); } catch(e){}
+        try { this.socket.emit('interaction', payload, (res) => { if (cb) cb(res); }); } catch (e) { if (cb) cb({ ok: false, reason: 'error' }); }
+      } catch (e) { if (cb) cb({ ok: false, reason: 'error' }); }
+    },
+
+    // Immediate interaction send bypassing throttling (uses socket ack)
+    sendInteractionImmediate(payload, cb) {
+      try {
+        if (!payload) { if (cb) cb({ ok: false, reason: 'invalid_payload' }); return; }
+        if (!this.socket || this.connected === false) {
+          this.pendingHandQueue = this.pendingHandQueue || [];
+          this.pendingHandQueue.push({ _interaction: true, payload });
+          if (this.pendingHandQueue.length > (this.pendingHandQueueMax || 200)) this.pendingHandQueue.shift();
+          if (cb) cb({ ok: false, reason: 'not_connected' });
+          return;
+        }
+        try { console.debug && console.debug('NET: sendInteractionImmediate()', payload); } catch(e){}
+        try { this.socket.emit('interaction', payload, (res) => { if (cb) cb(res); }); } catch (e) { if (cb) cb({ ok: false, reason: 'error' }); }
+      } catch (e) { if (cb) cb({ ok: false, reason: 'error' }); }
+    },
+
+    // Send avatar/authoritative object updates (low-frequency). Payload should be small
+    // and use normalized coordinates when possible: { game, x, y, vx?, vy?, ts? }
+    sendAvatarUpdate(payload) {
+      try {
+        if (!this.socket || this.connected === false) {
+          // queue as a best-effort fallback
+          this.pendingHandQueue = this.pendingHandQueue || [];
+          this.pendingHandQueue.push({ _avatar: true, payload });
+          if (this.pendingHandQueue.length > (this.pendingHandQueueMax || 200)) this.pendingHandQueue.shift();
+          return;
+        }
+        try { console.debug && console.debug('NET: sendAvatarUpdate()', payload); } catch(e){}
+        try { this.socket.emit('avatar_update', payload); } catch (e) {}
+      } catch (e) {}
+    },
+
+    // Immediate avatar send bypassing throttling
+    sendAvatarUpdateImmediate(payload) {
+      try {
+        if (!payload) return;
+        if (!this.socket || this.connected === false) {
+          this.pendingHandQueue = this.pendingHandQueue || [];
+          this.pendingHandQueue.push({ _avatar: true, payload });
+          if (this.pendingHandQueue.length > (this.pendingHandQueueMax || 200)) this.pendingHandQueue.shift();
+          return;
+        }
+        try { console.debug && console.debug('NET: sendAvatarUpdateImmediate()', payload); } catch(e){}
+        try { this.socket.emit('avatar_update', payload); } catch (e) {}
+      } catch (e) {}
+    },
+
     postScore({ game = 'default', name = 'Anonymous', score }, cb) {
       if (!this.socket) {
         // fallback to REST
@@ -460,6 +579,13 @@ Notes:
         return;
       }
       this.socket.emit('score', { game, name, score }, (res) => {
+        if (cb) cb(res);
+      });
+    },
+
+    sendScore(score, cb) {
+      if (!this.socket) return cb && cb({ ok: false, reason: 'not_connected' });
+      this.socket.emit('player_score', { score }, (res) => {
         if (cb) cb(res);
       });
     },

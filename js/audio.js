@@ -115,6 +115,17 @@ Fallback:
       const vol = typeof opts.volume === 'number' ? opts.volume : 0.6;
       const crossMs = typeof opts.crossfadeMs === 'number' ? opts.crossfadeMs : 450;
 
+      // Delegate BGM playback to centralized musicController when available.
+      try {
+        const mc = window.__handNinja && window.__handNinja.musicController;
+        const url = this.map && this.map[key];
+        const isBgmKey = (key && (key === 'bgm' || key.startsWith('bgm'))) || (url && /bgm/i.test(url));
+        if (mc && isBgmKey && url) {
+          mc.start(url, { force: true, vol });
+          return;
+        }
+      } catch (e) {}
+
       // If WebAudio available and buffer loaded, play using AudioBufferSourceNode
       if (this.ctx && this.buffers[key]) {
         try {
@@ -177,6 +188,16 @@ Fallback:
 
     stopBgm(opts = {}) {
       const crossMs = typeof opts.crossfadeMs === 'number' ? opts.crossfadeMs : 300;
+
+      // Delegate to centralized musicController if present
+      try {
+        const mc = window.__handNinja && window.__handNinja.musicController;
+        if (mc) {
+          mc.stop({ force: true });
+          return;
+        }
+      } catch (e) {}
+
       if (this.ctx && this.bgm && this.bgm.source) {
         try {
           const now = this.ctx.currentTime;

@@ -34,6 +34,13 @@
     }
     playBgm(key, vol = 0.6){
       if (!this.unlocked) return;
+      // Prefer centralized musicController for BGM-like keys/URLs
+      try {
+        const mc = window.__handNinja && window.__handNinja.musicController;
+        const url = this.map && this.map[key];
+        const isBgmKey = (key && (key === 'bgm' || key.startsWith('bgm'))) || (url && /bgm/i.test(url));
+        if (mc && isBgmKey && url) { mc.start(url, { force: true, vol }); this.bgmKey = key; return; }
+      } catch(e){}
       if (this.bgm && this.bgmKey === key) return;
       if (this.bgm){ try { this.bgm.pause(); } catch(e){} this.bgm = null; }
       const src = (this.buff[key] && this.buff[key].src) ? this.buff[key].src : (this.map[key] || null);
@@ -45,6 +52,10 @@
       this.bgm = a; this.bgmKey = key;
     }
     stopBgm(){
+      try {
+        const mc = window.__handNinja && window.__handNinja.musicController;
+        if (mc) { mc.stop({ force: true }); }
+      } catch(e){}
       if (this.bgm) try { this.bgm.pause(); } catch(e){}
       this.bgm = null; this.bgmKey = null;
     }

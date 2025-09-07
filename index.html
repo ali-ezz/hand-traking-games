@@ -41,6 +41,46 @@ task_progress
     .leader-row .name { overflow:hidden; text-overflow:ellipsis; }
     .leader-row .leader-score { text-align:right; font-variant-numeric: tabular-nums; }
 
+    /* Fixed leaderboard dimensions and better centering */
+    #leaderboard {
+      position:fixed;
+      z-index:10000;
+      top:50%;
+      left:50%;
+      transform:translate(-50%, -50%);
+      display:none;
+      pointer-events:auto;
+      max-width:90vw;
+      max-height:90vh;
+    }
+
+    #leaderboard > div {
+      background:rgba(0,0,0,0.95);
+      padding:18px;
+      border-radius:12px;
+      width:420px;
+      max-width:92vw;
+      color:#fff;
+      font-family:system-ui, -apple-system, sans-serif;
+      font-size:14px;
+      max-height:84vh;
+      overflow:auto;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+
+    /* Enhanced room high score display */
+    #roomHighScore {
+      background: rgba(255,165,0,0.15);
+      border: 1px solid rgba(255,165,0,0.3);
+      font-weight: 600;
+      color: #ffd700;
+    }
+
+    #roomHighScore:empty,
+    #roomHighScore:not([data-visible]) {
+      display: none !important;
+    }
+
     /* HUD pulse animation used by the game for tactile score feedback */
     .score.pulse {
       animation: pulse 360ms ease;
@@ -111,6 +151,7 @@ task_progress
     <div id="ui" style="z-index:20; display:flex; align-items:center; gap:8px;">
       <div class="score" id="score">Score: 0</div>
       <div class="score" id="timer" style="margin-left:8px">Time: 0</div>
+      <div class="score" id="roomHighScore" style="margin-left:8px; display:none;">Best: ?</div>
 
       <!-- Paint toolbar (shown only for Paint Air mode) -->
         <div id="paintToolbar" style="display:none; align-items:center; gap:8px;">
@@ -127,6 +168,7 @@ task_progress
         <label style="font-size:13px; color:#ddd; display:flex; align-items:center; gap:6px; margin-left:6px;">
           <input type="checkbox" id="musicCheckbox" /> Music
         </label>
+        <button id="leaveGameBtn" class="btn" style="display:none">Leave Game</button>
       </div>
       <button id="startBtn" class="btn" style="display:none">Start</button>
       <button id="pauseBtn" class="btn" style="display:none">Pause</button>
@@ -136,8 +178,8 @@ task_progress
     <div id="notice">Allow camera access. Use your hand to slice fruits.</div>
 
     <!-- Leaderboard modal -->
-    <div id="leaderboard" style="position:absolute; z-index:40; inset:0; display:none; align-items:center; justify-content:center; pointer-events:auto;">
-      <div style="background:rgba(0,0,0,0.85); padding:18px; border-radius:12px; width:420px; color:#fff;">
+    <div id="leaderboard" style="position:fixed; z-index:10000; top:50%; left:50%; transform:translate(-50%, -50%); display:none; pointer-events:auto; max-width:90vw; max-height:90vh;">
+      <div style="background:rgba(0,0,0,0.95); padding:18px; border-radius:12px; width:420px; max-width:90vw; color:#fff; font-family:system-ui, -apple-system, sans-serif; font-size:14px; max-height:80vh; overflow:auto; box-shadow: 0 8px 32px rgba(0,0,0,0.5);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
           <h3 style="margin:0">Leaderboard</h3>
           <div style="display:flex; gap:8px; align-items:center;">
@@ -146,7 +188,7 @@ task_progress
         </div>
 
         <div style="display:block;">
-          <div style="min-width:320px;">
+          <div style="width:100%;">
             <h4 style="margin:6px 0 8px 0; font-size:15px;">Top Scores</h4>
             <div style="max-height:320px; overflow:auto; margin:0; padding:0;">
               <ol id="leadersTop" class="leadersList" style="margin:0; padding:0;"></ol>
@@ -155,6 +197,7 @@ task_progress
         </div>
 
         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
+          <button id="leaveGameBtn" class="btn">Leave Game</button>
           <button id="clearLeadersBtn" class="btn">Clear</button>
         </div>
       </div>

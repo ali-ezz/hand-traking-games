@@ -379,6 +379,9 @@ Purpose:
         STATE.peers = res.peers || [];
         // room_update will follow from server with authoritative metadata (admin, game, status)
         updateRoomUI();
+        try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+        try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
         renderRooms([]); // refresh counts will be received from server event too
         body.style.display = 'none';
         toggleBtn.textContent = 'Open';
@@ -390,6 +393,9 @@ Purpose:
       STATE.peers = [];
       STATE.isAdmin = false;
       updateRoomUI();
+      try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+      try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+      try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
     });
 
     NET.on('peer_join', (p) => {
@@ -397,6 +403,9 @@ Purpose:
       // avoid duplicates
       if (!STATE.peers.find(x => x.id === p.id)) STATE.peers.push(p);
       updateRoomUI();
+      try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+      try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+      try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
       // Ask server for an authoritative room update so display names and metadata sync promptly
       try { if (NET && NET.socket) NET.socket.emit('request_room_update'); } catch(e){}
     });
@@ -404,6 +413,9 @@ Purpose:
     NET.on('peer_leave', (p) => {
       STATE.peers = (STATE.peers || []).filter(x => x.id !== p.id);
       updateRoomUI();
+      try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+      try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+      try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
     });
 
     // authoritative room metadata updates (includes admin id, game, timeLimit, status, players[])
@@ -435,6 +447,9 @@ Purpose:
       try { attachSmallBar(); } catch (e) {}
 
       updateRoomUI();
+      try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+      try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+      try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
     });
 
     // when server says game_start, prepare client using authoritative params
@@ -447,6 +462,28 @@ Purpose:
           if (sel) sel.value = data.game;
           if (document.getElementById('gameLength')) document.getElementById('gameLength').value = data.timeLimit || 45;
         }
+
+        // Update authoritative timing in room state so UI can show consistent time-left.
+        // Prefer server-provided startTs/endTs; fall back to timeLimit derivation when appropriate.
+        try {
+          if (STATE.room) {
+            if (data && typeof data.startTs !== 'undefined') {
+              STATE.room.startTs = Number(data.startTs);
+            }
+            if (data && typeof data.endTs !== 'undefined') {
+              STATE.room.endTs = Number(data.endTs);
+            } else if (data && typeof data.startTs !== 'undefined' && typeof data.timeLimit !== 'undefined') {
+              // server provided start + duration in seconds
+              STATE.room.endTs = Number(data.startTs) + (Number(data.timeLimit) * 1000);
+            }
+            if (data && typeof data.timeLimit !== 'undefined') {
+              STATE.room.timeLimit = Number(data.timeLimit);
+            }
+            // reflect changes in UI immediately
+            try { updateRoomUI(); } catch(e){}
+          }
+        } catch (inner) { console.warn('game_start timing sync failed', inner); }
+
         // Do NOT start gameplay here. Wait for the authoritative 'game_begin' event from server
         // to actually begin the game (this ensures all clients use the same seed and start time).
         // Use this event only to warm/preload camera or assets if needed.

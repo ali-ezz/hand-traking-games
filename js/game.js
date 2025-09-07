@@ -1,17 +1,22 @@
-// task_progress
-// - [x] Analyze requirements
-// - [x] Set up necessary files (index.html exists)
-// - [x] Implement MediaPipe Hands + camera integration
-// - [x] Implement fruit spawn, physics, and slicing detection
-// - [x] Implement menu, score, timer and leaderboard persistence
-// - [x] Add bombs that deduct points and make fruits/bombs slower & fewer
-// - [ ] Wire audio assets (in code; assets files to be placed in assets/)
-// - [ ] Add particle polish, sprite support and floating score popups
-// - [ ] Extensive playtesting and tuning
+ // task_progress: COMPLETED - multiplayer complex synchronization system implemented
+ // - [x] Analyze requirements
+ // - [x] Set up necessary files (index.html exists)
+ // - [x] Implement MediaPipe Hands + camera integration
+ // - [x] Implement fruit spawn, physics, and slicing detection
+ // - [x] Implement menu, score, timer and leaderboard persistence
+ // - [x] Add bombs that deduct points and make fruits/bombs slower & fewer
+ // - [x] Add stronger hands.send guards, logging and recreate/backoff
+ // - [x] Wire audio assets (in code; assets files to be placed in assets/)
+ // - [x] Fix maze level progression synchronization for all users
+ // - [x] Verify music gating behavior for admin and non-admin
+ // - [x] Add multiplayer server-authoritative game state management
+ // - [x] Implement peer object state synchronization
+ // - [x] Add particle polish, sprite support and floating score popups
+ // - [ ] Extensive playtesting and tuning (awaiting user feedback)
  // task_progress: leaders: dedupe same names (keep highest) + show placeholder implemented
  // task_progress_update:
  // - [x] Wire Paint toolbar controls and no-timer paint flow
-//
+ //
 // js/game.js — core game logic (modified to wire assets, popups, and robustness)
 // Loads via <script type="module" src="js/game.js"></script>
 
@@ -62,6 +67,7 @@ const canvas = document.getElementById('output_canvas');
 const ctx = canvas.getContext('2d');
 const menuEl = document.getElementById('menu');
 const playerNameEl = document.getElementById('playerName');
+let prevLocalName = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? String(playerNameEl.value || playerNameEl.placeholder) : 'Player';
 const gameLengthEl = document.getElementById('gameLength');
 const menuStartBtn = document.getElementById('menuStartBtn');
 const showLeadersBtn = document.getElementById('showLeadersBtn');
@@ -133,25 +139,419 @@ let running = false;
 let startTime = 0;
 let duration = 45;
 let score = 0;
+let roomHighScore = null; // server-provided room high-score (name, score)
 
 // Networking / peer ghost state
 const NET_QUANT_MAX = 1000;
 const peerGhosts = Object.create(null); // id -> { target: [{x,y,z}], display: [{x,y,z}], lastTs }
 const peerPaints = Object.create(null); // id -> [ {x,y,t,color,size} ]
 
-// Multiplayer game state synchronization
-let serverGameState = null; // Server-generated game state
-let roomScores = {}; // Per-player scores from server
-let localPlayerId = null; // Local player's socket ID
-let isMultiplayerGame = false; // Whether we're in a multiplayer room game
+// Keep latest room high-scores per game so we can show the correct "room best"
+// for the currently selected game. This enables dynamic per-game room best display.
+const roomHighScoresByGame = Object.create(null);
+const roomHighScoreResetTimestamps = Object.create(null);
+const roomHighScoreEditedTimestamps = Object.create(null);
 
-// Physics & spawn tuning (slower & fewer)
-const GRAVITY = 1200; // px/s^2
-const FRUIT_SPAWN_INTERVAL = 1400; // ms (longer -> fewer)
-const BOMB_SPAWN_INTERVAL = 5000; // ms (rare)
-const MAX_FRUITS = 6;
-const MAX_BOMBS = 2;
-const HIT_PADDING = 24;
+ // Return array of peer names (normalized) currently known from peerGhosts
+function getPeerNames() {
+  const names = [];
+  try {
+    for (const k of Object.keys(peerGhosts || {})) {
+      try {
+        // Prefer the locally-disambiguated display name when available.
+        const st = peerGhosts[k];
+        const n = st && (st._displayName || st.name) ? String(st._displayName || st.name).trim() : null;
+        if (n) names.push(n);
+      } catch(e){}
+    }
+  } catch(e){}
+  return names;
+}
+
+ // Return peer names but exclude the local client (when NET.socket.id is available).
+// This helps ensure uniqueness checks don't accidentally treat our own echoed name as a duplicate.
+function getPeerNamesExcludingSelf() {
+  const names = [];
+  try {
+    const selfId = (typeof NET !== 'undefined' && NET && NET.socket && NET.socket.id) ? NET.socket.id : null;
+    for (const id of Object.keys(peerGhosts || {})) {
+      try {
+        if (selfId && id === selfId) continue;
+        const st = peerGhosts[id];
+        const n = st && (st._displayName || st.name) ? String(st._displayName || st.name).trim() : null;
+        if (n) names.push(n);
+      } catch(e){}
+    }
+  } catch(e){}
+  return names;
+}
+
+// Normalize peer display names to avoid exact duplicates in the local UI.
+// This only affects local display (peerGhosts[*]._displayName) and does not change remote clients.
+// Strategy:
+//  - Build a case-insensitive map of names -> [ids]
+//  - For any name with count > 1, append " (2)", " (3)"... to all but the first entry.
+//  - Prefer the most-recently-updated peer as the canonical first entry (based on lastTs).
+function dedupePeerDisplayNames() {
+  try {
+    const map = Object.create(null);
+    for (const [id, st] of Object.entries(peerGhosts || {})) {
+      try {
+        const raw = st && st.name ? String(st.name).trim() : 'Player';
+        const key = (raw || 'Player').toLowerCase();
+        (map[key] = map[key] || []).push({ id, raw, ts: (st && st.lastTs) ? Number(st.lastTs) : 0 });
+      } catch (e) { /* ignore per-peer errors */ }
+    }
+
+    for (const key of Object.keys(map)) {
+      const arr = map[key];
+      if (!arr || arr.length <= 1) {
+        // ensure displayName is canonical when unique
+        if (arr && arr[0]) {
+          try { const st = peerGhosts[arr[0].id]; if (st) st._displayName = st.name; } catch(e){}
+        }
+        continue;
+      }
+      // sort by lastTs descending so the freshest remains unmodified
+      arr.sort((a,b) => (b.ts || 0) - (a.ts || 0));
+      for (let i = 0; i < arr.length; i++) {
+        const ent = arr[i];
+        try {
+          const st = peerGhosts[ent.id];
+          if (!st) continue;
+          if (i === 0) {
+            // canonical first entry keeps original name
+            st._displayName = st.name;
+          } else {
+            // append a numeric suffix for local-disambiguation
+            const suffix = ` (${i+1})`;
+            st._displayName = `${st.name || 'Player'}${suffix}`;
+          }
+        } catch (e) { /* ignore per-peer set errors */ }
+      }
+    }
+  } catch (e) {
+    console.warn('dedupePeerDisplayNames failed', e);
+  }
+}
+
+try { window.dedupePeerDisplayNames = dedupePeerDisplayNames; } catch(e){}
+
+// Ensure the local player's name is unique within the current peer set.
+// If duplicate found, append a numeric suffix "(2)", "(3)" etc until unique.
+// Also update the placeholder suggestion so users see the unique variant.
+function ensureLocalNameUnique() {
+  try {
+    if (!playerNameEl) return;
+    const raw = (playerNameEl.value || '').trim() || '';
+    // Use the visible placeholder as the base if the input is empty, otherwise use the typed name.
+    const base = raw || (playerNameEl.placeholder ? String(playerNameEl.placeholder).trim() : 'Player') || 'Player';
+    const peers = getPeerNamesExcludingSelf().map(n => (n || '').toLowerCase());
+
+    // generate candidate names (base, base (2), base (3), ...)
+    let candidate = base;
+    let i = 1;
+    while (peers.indexOf((candidate || '').toLowerCase()) !== -1) {
+      i++;
+      candidate = `${base} (${i})`;
+      // safety cap to avoid infinite loops
+      if (i > 99) break;
+    }
+
+    // If user hasn't typed an explicit value (empty), set placeholder to the unique suggestion.
+    if (!raw) {
+      try { playerNameEl.placeholder = candidate; } catch (e) {}
+      return;
+    }
+
+    // If user typed a name that collides with an existing peer name, adjust both the visible value
+    // and the placeholder so the user sees the resolved unique variant immediately.
+    if (peers.indexOf(raw.toLowerCase()) !== -1) {
+      try { playerNameEl.value = candidate; } catch(e){}
+      try { playerNameEl.placeholder = candidate; } catch(e){}
+      return;
+    }
+
+    // If user-provided name is already unique, still update placeholder to a safe suggestion
+    // (this helps when peers join later and the placeholder should reflect a unique fallback).
+    try { playerNameEl.placeholder = (playerNameEl.placeholder && playerNameEl.placeholder.trim()) || candidate; } catch(e){}
+
+  } catch (e) { /* ignore uniqueness errors */ }
+}
+
+try { window.ensureLocalNameUnique = ensureLocalNameUnique; } catch(e){}
+
+// Update the visible room high score element to reflect the best for currentGameId.
+// If none available for the selected game, hide/clear the element.
+// This augmented implementation will:
+//  - prefer authoritative roomHighScoresByGame[gid] when present
+//  - otherwise compute the best score dynamically from peerGhosts (and local score)
+//  - present a disambiguated display name by consulting peerGhosts[*]._displayName when possible
+function updateRoomHighScoreDisplay() {
+  try {
+    const roomHighScoreEl = document.getElementById('roomHighScore');
+    const gid = currentGameId || 'default';
+    // Only show room high-score UI when the client is inside a multiplayer room.
+    // Hide it for single-player/local runs to avoid confusing the user.
+    try {
+      const roomsStateLocal = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+      if (!roomsStateLocal || !roomsStateLocal.room) {
+        // ensure the DOM element is hidden for single-player flows
+        if (roomHighScoreEl) {
+          roomHighScoreEl.textContent = '';
+          roomHighScoreEl.removeAttribute('data-visible');
+          roomHighScoreEl.style.display = 'none';
+        }
+        // also clear runtime cached roomHighScore so other UI paths don't think a room best exists
+        roomHighScore = null;
+        return;
+      }
+    } catch (e) {}
+
+    // Prefer server-provided cached high for this game
+    let rh = roomHighScoresByGame[gid] || null;
+
+    // If this client recently performed a local "reset" of the room high-score, prefer the local
+    // zeroed entry when the local reset timestamp is newer than any server-provided timestamp.
+    // This prevents server-delivered highs from immediately overriding a user's intentional reset.
+    try {
+      const localResetTs = (roomHighScoreResetTimestamps && roomHighScoreResetTimestamps[gid]) ? Number(roomHighScoreResetTimestamps[gid]) : 0;
+      const serverTs = rh ? (Number(rh._serverTs) || Number(rh.ts) || Number(rh.t) || Number(rh.updatedAt) || Number(rh.updated) || 0) : 0;
+      const localEditTs = (roomHighScoreEditedTimestamps && roomHighScoreEditedTimestamps[gid]) ? Number(roomHighScoreEditedTimestamps[gid]) : 0;
+
+      // Prefer a recent local name edit over an older server-supplied record.
+      // This ensures local name changes immediately reflect in the UI even if the server still
+      // holds an older name for the same score.
+      if (localEditTs && localEditTs > serverTs) {
+        try {
+          const localName = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : '';
+          if (rh) {
+            rh = Object.assign({}, rh, { name: localName });
+            roomHighScoresByGame[gid] = rh;
+          } else if (localName) {
+            // Create a benign local entry to surface the updated name in the UI
+            const clientId = (function() { try { return localStorage.getItem('hand_ninja_client_id'); } catch(e) { return null; } })();
+            roomHighScoresByGame[gid] = { name: String(localName), score: 0, game: gid, clientId: clientId || null };
+            rh = roomHighScoresByGame[gid];
+          }
+        } catch(e){}
+      } else if (localResetTs && localResetTs > serverTs) {
+        // prefer the locally-zeroed entry if present; otherwise clear rh to allow computed/live peers to win
+        const localEntry = roomHighScoresByGame[gid];
+        if (localEntry && typeof localEntry.score === 'number') {
+          rh = localEntry;
+        } else {
+          rh = null;
+        }
+      }
+    } catch (e) { /* ignore timestamp heuristics failures */ }
+
+    // Compute dynamic best among peerGhosts and local score; prefer live peer/local data when available.
+    try {
+      const PRESENCE_THRESHOLD_MS = 120000; // only consider peers updated within this window as "present" (increased to 120s to avoid premature "Player" fallbacks)
+      const nowTs = Date.now();
+
+      let bestFromPeers = null;
+      for (const [id, st] of Object.entries(peerGhosts || {})) {
+        try {
+          // Only consider peers with recent updates (presence) to avoid showing stale/offline scores.
+          if (!st || typeof st.score !== 'number') continue;
+          if (!st.lastTs || (nowTs - Number(st.lastTs)) > PRESENCE_THRESHOLD_MS) continue;
+          const s = Number(st.score);
+          const name = (st._displayName || st.name) ? String(st._displayName || st.name).trim() : 'Player';
+          if (!bestFromPeers || s > bestFromPeers.score) {
+            bestFromPeers = { id, name, score: s, ts: st.lastTs || 0 };
+          } else if (s === bestFromPeers.score) {
+            // Prefer the more recently-updated peer when scores tie.
+            if ((st.lastTs || 0) > (bestFromPeers.ts || 0)) bestFromPeers = { id, name, score: s, ts: st.lastTs || 0 };
+          }
+        } catch(e){}
+      }
+
+      // consider local score as well (treat local as candidate). Local player is always "present".
+      try {
+        if (typeof score === 'number') {
+          const localName = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : 'You';
+          if (!bestFromPeers || score > bestFromPeers.score || (score === bestFromPeers.score && bestFromPeers.id === 'local')) {
+            bestFromPeers = { id: (NET && NET.socket && NET.socket.id) || 'local', name: String(localName).trim(), score: Number(score), ts: Date.now() };
+          }
+        }
+      } catch(e){}
+
+      // Prefer peer/local computed best when it's missing on the server or equal/greater than server value.
+      if ((!rh || typeof rh.score !== 'number') && bestFromPeers) {
+        rh = { name: bestFromPeers.name, score: bestFromPeers.score };
+        roomHighScoresByGame[gid] = rh;
+      } else if (rh && typeof rh.score === 'number') {
+        // If server value exists, only override it with a live peer/local value when that peer is present
+        // and has equal/greater score to avoid showing stale server highs for absent players.
+        if (bestFromPeers && bestFromPeers.score >= rh.score) {
+          rh = { name: bestFromPeers.name, score: bestFromPeers.score };
+          roomHighScoresByGame[gid] = rh;
+        } else {
+          // Keep server value but attempt to keep the name in sync with any peer that currently holds that score.
+          // Prefer recent/present peers, but if the cached name is missing or generic ('Player'),
+          // relax presence checks to find any matching peer and adopt its display name.
+          let matched = false;
+          for (const [id, st] of Object.entries(peerGhosts || {})) {
+            try {
+              if (!st || typeof st.score !== 'number') continue;
+              const isRecent = st.lastTs && (nowTs - Number(st.lastTs)) <= PRESENCE_THRESHOLD_MS;
+              // Accept if score matches and (peer is recent OR cached name is not meaningful)
+              if (st.score === rh.score && (isRecent || !rh.name || String(rh.name).trim().toLowerCase() === 'player')) {
+                rh.name = (st._displayName || st.name) || rh.name;
+                roomHighScoresByGame[gid] = rh;
+                matched = true;
+                break;
+              }
+            } catch(e){}
+          }
+
+          // Also ensure local player's current name is used if the cached score equals local score.
+          // Prefer this when no better peer name was found.
+          try {
+            if ((!rh.name || String(rh.name).trim() === '' || String(rh.name).toLowerCase() === 'player') &&
+                typeof score === 'number' && rh && Number(rh.score) === Number(score)) {
+              rh.name = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : rh.name;
+              roomHighScoresByGame[gid] = rh;
+            }
+          } catch(e){}
+        }
+      }
+    } catch (e) {
+      // tolerate peer scanning failures and fall back to server value
+    }
+
+    // Fallback: if the cached server value has a generic name, try to resolve a friendlier display name.
+    // Prefer a matching peerGhosts entry (ignore strict presence) or the local player's current name when appropriate.
+    try {
+      if (rh && (typeof rh.name !== 'string' || String(rh.name).trim() === '' || String(rh.name).trim().toLowerCase() === 'player')) {
+        for (const [pid, pst] of Object.entries(peerGhosts || {})) {
+          try {
+            if (!pst || typeof pst.score !== 'number') continue;
+            if (Number(pst.score) === Number(rh.score)) {
+              rh.name = (pst._displayName || pst.name) || rh.name;
+              roomHighScoresByGame[gid] = rh;
+              break;
+            }
+          } catch(e){}
+        }
+        // If still generic and the local player's score matches, use local name (value or placeholder).
+        if ((!rh.name || String(rh.name).trim().toLowerCase() === 'player') && typeof score === 'number' && Number(rh.score) === Number(score)) {
+          rh.name = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : rh.name;
+          roomHighScoresByGame[gid] = rh;
+        }
+      }
+    } catch(e){}
+
+    // If server supplied a clientId for the high scorer and it matches our local client id, prefer our current name.
+    try {
+      if (rh && rh.clientId) {
+        const localCid = localStorage.getItem('hand_ninja_client_id');
+        if (localCid && rh.clientId === localCid) {
+          rh.name = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : rh.name;
+          roomHighScoresByGame[gid] = rh;
+        }
+      }
+    } catch(e){}
+
+    if (roomHighScoreEl) {
+      if (rh && typeof rh.score === 'number') {
+        const name = (rh.name || 'Player').slice(0,12);
+        roomHighScoreEl.textContent = `Room Best: ${name}: ${rh.score}`;
+        roomHighScoreEl.setAttribute('data-visible', 'true');
+        roomHighScoreEl.style.display = 'inline-block';
+      } else {
+        roomHighScoreEl.textContent = '';
+        roomHighScoreEl.removeAttribute('data-visible');
+        roomHighScoreEl.style.display = 'none';
+      }
+    }
+
+    // also keep the runtime roomHighScore variable consistent (used elsewhere)
+    roomHighScore = rh;
+  } catch (e) { /* ignore UI errors */ }
+}
+
+try { window.updateRoomHighScoreDisplay = updateRoomHighScoreDisplay; } catch(e){}
+
+ // Server-authoritative scheduling state
+let scheduledGameItems = []; // items supplied by server or generated from seed
+
+// Centralized cleanup helper used by Leave and Kick flows.
+// Ensures consistent teardown: post score, end game, clear room high-score cache and UI, and leave room UI.
+function cleanupAfterLeave() {
+  try {
+    const sel = document.getElementById('gameSelect');
+    const gid = (sel && sel.value) ? sel.value : currentGameId;
+    const name = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder) : 'Player';
+
+    // Post score to server if available and we were running
+    try {
+      if (running) {
+        if (window.NET && typeof window.NET.postScore === 'function') {
+          try { window.NET.postScore({ game: gid, name: String(name).slice(0,24), score }); } catch(e){}
+        } else {
+          try {
+            fetch(`/leaderboard`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ game: gid, name: String(name).slice(0,24), score })
+            }).catch(()=>{});
+          } catch(e){}
+        }
+      }
+    } catch (e) {}
+
+    // Ensure game ends and UI state reset
+    try { if (running) endGame(); } catch(e){}
+
+    // Reset room high score for current game to a zeroed entry using the local player's name.
+    // This keeps the UI consistent (shows "Room Best: <your-name>: 0") instead of hiding the element
+    // or deleting the cached entry which can produce inconsistent behaviour across flows.
+    try {
+      const clientId = (function() { try { return localStorage.getItem('hand_ninja_client_id'); } catch(e) { return null; } })();
+      const localName = String(name || 'Player').slice(0,24);
+      roomHighScoresByGame[gid] = { name: localName, score: 0, game: gid, clientId: clientId || null };
+      try { roomHighScoreResetTimestamps[gid] = Date.now(); } catch(e) {}
+      roomHighScore = roomHighScoresByGame[gid];
+      if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay();
+
+      const roomHighScoreEl = document.getElementById('roomHighScore');
+      if (roomHighScoreEl) {
+        roomHighScoreEl.textContent = `Room Best: ${String(roomHighScore.name || 'Player').slice(0,12)}: ${Number(roomHighScore.score || 0)}`;
+        roomHighScoreEl.setAttribute('data-visible', 'true');
+        roomHighScoreEl.style.display = 'inline-block';
+      }
+    } catch (e) { console.warn('Failed to reset room high score in cleanupAfterLeave', e); }
+
+    // Ask ROOMS_UI to leave room if available
+    try { if (window.ROOMS_UI && typeof window.ROOMS_UI.leaveRoom === 'function') { window.ROOMS_UI.leaveRoom(); console.log('Left room via cleanupAfterLeave()'); } } catch(e){ console.warn('Failed to call ROOMS_UI.leaveRoom in cleanupAfterLeave', e); }
+
+    // hide leaderboard panel
+    try { leaderboardEl.style.display = 'none'; } catch(e){}
+  } catch (e) { console.warn('cleanupAfterLeave failed', e); }
+}
+let serverStartEpoch = null;  // epoch ms when the server-authoritative game started
+let serverAuthoritative = false; // true when server-driven spawns are active
+
+ // Physics & spawn tuning (slower & fewer)
+ // Tuned to reduce object density on-screen and make bombs rarer on lower-end devices.
+ const GRAVITY = 1200; // px/s^2
+ // Increase spawn interval to reduce per-second object rate (less clutter)
+ const FRUIT_SPAWN_INTERVAL = 2200; // ms (longer -> fewer)
+ // Make bombs significantly rarer to avoid frequent penalties
+ const BOMB_SPAWN_INTERVAL = 9000; // ms (very rare)
+  // Lower concurrent caps so fewer objects are visible at once
+  const MAX_FRUITS = 3;
+  // Increased bomb concurrency to make bombs more visible in both single-player and multiplayer.
+  // Tweak MAX_BOMBS to control solo counts; the multiplayer cap is computed by applying SERVER_SPAWN_MULTIPLIER.
+  const MAX_BOMBS = 4;
+  // When running in server-authoritative (multiplayer) mode, scale down spawn caps by this multiplier.
+  // Reduce multiplier so multiplayer shows noticeably fewer objects (helps crowded rooms).
+  // Set to 0.5 to roughly half client-side density for authoritative runs.
+  const SERVER_SPAWN_MULTIPLIER = 0.5;
+  const HIT_PADDING = 24;
 
 let lastFruitSpawn = 0;
 let lastBombSpawn = 0;
@@ -350,12 +750,6 @@ const runnerControlModule = (function(){
     if (avatar.y < 20) { avatar.y = 20; avatar.vy = 0; }
     if (avatar.y > height - 20) { avatar.y = height - 20; avatar.vy = 0; }
 
-    // Expose avatar position for peer rendering
-    try {
-      if (!window.__handNinja) window.__handNinja = {};
-      window.__handNinja._runnerAvatar = { x: avatar.x, y: avatar.y };
-    } catch(e) {}
-
     // spawn obstacles
     const now = performance.now();
     if (now - lastSpawn > OB_SPAWN_MS) {
@@ -457,9 +851,9 @@ const mazeModule = (function(){
     const actualH = h;
 
     // Allow opt-in override via window.__handNinja flags (useful for testing).
-    const useLogical = (window.__handNinja && typeof window.__handNinja.forceLogicalMaze !== 'undefined')
-      ? !!window.__handNinja.forceLogicalMaze
-      : true; // default: true to unify mazes across devices
+const useLogical = (window.__handNinja && typeof window.__handNinja.forceLogicalMaze !== 'undefined')
+  ? !!window.__handNinja.forceLogicalMaze
+  : false; // default: false so each device generates its own maze (do not force identical maze across devices)
 
     const LOGICAL_MAZE_W = (window.__handNinja && window.__handNinja.logicalMazeWidth) || 800;
     const LOGICAL_MAZE_H = (window.__handNinja && window.__handNinja.logicalMazeHeight) || 480;
@@ -670,11 +1064,21 @@ const mazeModule = (function(){
 
     // check exit reached (cell equality against any exit)
     if (exitCells && exitCells.some(e => e.cx === player.cx && e.cy === player.cy)) {
-      // reached exit: reward and advance to the next maze level instead of ending the game
+      // reached exit: reward and advance to the next maze level for ALL users
       spawnPopup && spawnPopup((canvas.width / DPR)/2, 80, 'Level Complete!', { col: 'lime', size: 24 });
       try { playSound && playSound('segment_complete'); } catch(e){}
       score += 100;
       updateUI();
+
+      // For multiplayer synchronization: Send maze completion to server to regenerate for all users
+      if (serverAuthoritative && window.NET && typeof window.NET.sendInteractionImmediate === 'function') {
+        window.NET.sendInteractionImmediate({
+          objectId: 'maze_complete_' + Date.now(),
+          x: 0.5, y: 0.5,
+          type: 'maze_advance'
+        });
+      }
+
       // briefly pause module while preparing next level
       runningModule = false;
       finished = false;
@@ -878,220 +1282,141 @@ const ASSETS = (() => {
 const soundPool = {};
 let bgmAudio = null;
 let musicEnabled = false;
+// Restore persisted user music preference early so UI and controller can read it.
+try {
+  const _m = localStorage.getItem('hand_ninja_music_enabled');
+  if (_m !== null) musicEnabled = (_m === '1' || _m === 'true' || _m === 'yes');
+} catch (e) { /* ignore localStorage errors */ }
 
-/* Centralized music controller to unify BGM behavior between solo and room flows.
-   - Only admin (or a server-forced flag) will actually start playback for a room.
-   - Non-admins will preload/ decode but will not auto-play when in a room.
-   - Provides safe start/stop that tears down all previous sources to avoid bleed/glitches.
+/* MusicController (refactor)
+   Centralized, small-surface music manager with clear policy:
+   - preload(url): attempts to decode/preload but does not auto-play
+   - start(url, {force, vol}): starts playback respecting room/admin policy unless force=true
+   - startGame(): convenience -> start(current asset)
+   - stop({force}): stops playback (force may be used by server)
+   - setRoomState({inRoom,isAdmin}): informs controller about room context
+   - getState(): returns minimal state for diagnostics
 */
 if (!window.__handNinja) window.__handNinja = {};
 window.__handNinja.musicController = (function() {
-  let _enabled = !!musicEnabled;
-  let _bgmUrl = ASSETS && ASSETS.bgm ? ASSETS.bgm : null;
-  let _isAdmin = false;
-  let _inRoom = false;
-  // internal counter to ignore stale/overlapping start attempts
-  let _startCounter = 0;
+  const state = { playing: false, url: null, inRoom: false, isAdmin: false, vol: 0.7 };
 
-  function isAllowedToPlay() {
-    // Allowed when not in a room (solo) OR when in a room (all clients can play admin's music).
-    return !_inRoom || _inRoom;
-  }
-
-  function setRoomState({ inRoom, isAdmin }) {
-    _inRoom = !!inRoom;
-    _isAdmin = !!isAdmin;
-    // record global flag for other code paths
-    try { if (typeof window !== 'undefined') { window.__handNinja._musicIsAdmin = _isAdmin; } } catch(e){}
-  }
-
-  function setEnabled(v) {
-    _enabled = !!v;
-    musicEnabled = !!v;
-    // store preference locally
-    try { localStorage.setItem('music_pref', _enabled ? '1' : '0'); } catch(e){}
-    if (!_enabled) stop(); // immediate stop on disable
-  }
-
-  async function preload(bgmUrl) {
-    if (!bgmUrl) return;
+  async function preload(url) {
+    if (!url) return false;
+    state.url = url;
     try {
-      // small debug trace for preload attempts
-      try { console.debug && console.debug('musicController.preload start', { bgmUrl }); } catch(e){}
-      // update cached ASSETS.bgm
-      _bgmUrl = bgmUrl;
-      ASSETS.bgm = bgmUrl;
-      // attempt to decode into WebAudio buffer (best-effort)
-      try { ensureAudioCtx(); } catch(e){}
-      try {
-        if (typeof decodeBgmBuffer === 'function') {
-          const _buf = await decodeBgmBuffer(bgmUrl).catch(()=>null);
-          try { console.debug && console.debug('musicController.preload decoded', { bgmUrl, ok: !!_buf }); } catch(e){}
-        }
-      } catch(e){
-        try { console.warn && console.warn('musicController.preload decode failed', e); } catch(e){}
-      }
-    } catch(e){}
-  }
-
-  function start(bgmUrl, { force = false, vol = 0.6 } = {}) {
-    try {
-      // debug entry: surface decision context for easier runtime tracing
-      try { console.debug && console.debug('musicController.start called', { bgmUrl, force, vol, musicEnabled: _enabled, inRoom: _inRoom, isAdmin: _isAdmin, cachedBgm: _bgmUrl }); } catch(e){}
-      if (!bgmUrl && !_bgmUrl) return false;
-      const url = bgmUrl || _bgmUrl;
-      if (!url) return false;
-
-      // don't auto-play when in-room and not admin unless forced
-      if (!force && !_enabled) return false;
-      if (!force && !isAllowedToPlay()) {
-        // only preload in this case
-        try { preload(url); } catch(e){}
-        return false;
-      }
-
-      // idempotent start: if same bgm url already playing, no-op to avoid duplicates
-      try {
-        if (_bgmUrl === url) {
-          try {
-            if (typeof decodedBgmPlaying !== 'undefined' && decodedBgmPlaying) return true;
-            if (typeof bgmAudio !== 'undefined' && bgmAudio && !bgmAudio.paused) return true;
-            const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
-            if (sa && sa.bgm && typeof sa.bgm.src === 'string' && sa.bgm.src === url) return true;
-          } catch(e){}
-        }
-      } catch(e){}
-
-      // register a local start id to ignore stale/overlapping starts
-      const _localStartId = ++_startCounter;
-
-      // stop everything first to prevent overlap/bleed
-      try { stopAllAudio(); } catch(e){}
-
-      // prefer decoded WebAudio if available
-      try {
-        if (sfxBuffers && sfxBuffers['bgm']) {
-          try {
-            const ctx = ensureAudioCtx();
-            if (!ctx) throw new Error('no-audioctx');
-            stopDecodedBgm();
-            const src = ctx.createBufferSource();
-            src.buffer = sfxBuffers['bgm'];
-            src.loop = true;
-            const g = ctx.createGain();
-            g.gain.value = vol;
-            src.connect(g);
-            g.connect(ctx.destination);
-            try { src.start(0); } catch(e){}
-            // Only register decoded node if this start is still the most recent request.
-            if (_localStartId === _startCounter) {
-              decodedBgmNode = { source: src, gain: g, url };
-              decodedBgmPlaying = true;
-              return true;
-            } else {
-              // stale start: stop and disconnect immediately
-              try { src.stop && src.stop(0); } catch(e){}
-              try { src.disconnect && src.disconnect(); } catch(e){}
-              try { g.disconnect && g.disconnect(); } catch(e){}
-              return false;
-            }
-          } catch (e) {
-            // fallthrough to other methods
-            console.warn('musicController: decoded WebAudio start failed', e);
-          }
-        }
-      } catch(e){}
-
-      // try SimpleAudio
-      try {
-        const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
-        if (sa && sa.unlocked) {
-          try {
-            sa.stopBgm();
-            sa.map.bgm = url;
-            sa.playBgm('bgm', vol);
-            // ensure this start is still current
-            if (_localStartId === _startCounter) {
-              return true;
-            } else {
-              try { sa.stopBgm(); } catch(e){}
-              return false;
-            }
-          } catch(e) {
-            console.warn('musicController: SimpleAudio start failed', e);
-          }
-        }
-      } catch(e){}
-
-      // HTMLAudio fallback
-      try {
-        const startId = _localStartId;
-        const inst = new Audio(url);
-        inst.loop = true;
-        inst.volume = Math.max(0, Math.min(1, vol));
-        inst.play().then(()=> {
-          // Only register this instance if it's the most recent start request.
-          if (startId === _startCounter) {
-            bgmAudio = inst;
-            soundPool.bgm = inst;
-          } else {
-            // stale start: tear down this instance immediately
-            try { inst.pause(); inst.src = ''; } catch(e){}
-          }
-        }).catch((err) => {
-          console.warn('musicController: HTMLAudio play failed', err);
-        });
-        return true;
-      } catch(e){
-        console.warn('musicController: HTMLAudio creation failed', e);
-      }
+      // Best-effort decode into WebAudio for fast start
+      await decodeBgmBuffer(url).catch(()=>null);
+      return true;
+    } catch (e) {
+      console.warn('musicController.preload failed', e);
       return false;
-    } catch(e){ console.warn('musicController.start failed', e); return false; }
+    }
   }
 
-  function stop() {
-    try {
-      // invalidate any pending starts so asynchronous play() handlers will be ignored
-      try { _startCounter++; } catch(e){}
-      // reuse existing global stopAllAudio which is comprehensive
-      try { stopAllAudio(); } catch(e){}
-    } catch(e){}
+  function setRoomState({ inRoom = false, isAdmin = false } = {}) {
+    state.inRoom = !!inRoom;
+    state.isAdmin = !!isAdmin;
   }
 
-  function onRoomUpdate(data) {
-    try {
-      setRoomState({ inRoom: !!(data && data.room), isAdmin: !!(data && data.isAdmin) });
-      // if we are non-admin and music is enabled, don't auto-start; just preload bgm
-      if (data && data.bgmUrl) preload(data.bgmUrl).catch(()=>{});
-    } catch(e){}
+  function getState() {
+    return Object.assign({}, state);
   }
 
-  function onGameBegin(data) {
+  // Internal helper: start decoded BGM if available else fallback to SimpleAudio/HTMLAudio
+  async function _playUrl(url, vol = 0.7, { loop = true } = {}) {
     try {
-      // server may include a flag 'forcePlayAll' to request all clients play BGM
-      const forceAll = !!(data && data.forcePlayAll);
-      const url = (data && data.bgmUrl) ? data.bgmUrl : (ASSETS && ASSETS.bgm) ? ASSETS.bgm : _bgmUrl;
-      if (!url) return;
-      preload(url).catch(()=>{});
-      if (forceAll) {
-        // start on all clients if user allowed music
-        if (_enabled) start(url, { force: true });
-      } else {
-        // otherwise only admin or solo starts
-        if (isAllowedToPlay() && _enabled) start(url, { force: false });
+      if (!url) return false;
+      // Try decoded WebAudio buffer
+      if (sfxBuffers && sfxBuffers['bgm']) {
+        try {
+          stopDecodedBgm();
+          playDecodedBgm(url, { vol, loop });
+          state.playing = true;
+          return true;
+        } catch(e) { /* fallthrough */ }
       }
-    } catch(e){ console.warn('musicController.onGameBegin failed', e); }
+      // If decode already cached globally
+      if (decodedBgm && decodedBgmUrl === url) {
+        try { playDecodedBgm(url, { vol, loop }); state.playing = true; return true; } catch(e){}
+      }
+
+      // Try SimpleAudio
+      const sa = window.__handNinja && window.__handNinja._simpleAudio;
+      if (sa && sa.unlocked) {
+        try {
+          sa.stopBgm && sa.stopBgm();
+          sa.map && (sa.map.bgm = url);
+          sa.playBgm && sa.playBgm('bgm', vol);
+          state.playing = true;
+          return true;
+        } catch (e) { /* fallthrough */ }
+      }
+
+      // Last resort: HTMLAudio
+      try {
+        stopAllAudio();
+        const a = new Audio(url);
+        a.loop = !!loop;
+        a.volume = Math.max(0, Math.min(1, vol));
+        a.play().then(() => { bgmAudio = a; soundPool.bgm = a; }).catch(()=>{});
+        state.playing = true;
+        return true;
+      } catch(e) { console.warn('musicController HTMLAudio start failed', e); return false; }
+    } catch (e) {
+      console.warn('musicController _playUrl failed', e);
+      return false;
+    }
   }
+
+  // Public start: honor room/admin policy unless force=true
+  async function start(url, { force = false, vol = 0.7 } = {}) {
+    const u = url || state.url || (ASSETS && ASSETS.bgm);
+    if (!u) return false;
+    state.url = u;
+    state.vol = vol;
+    // Policy: non-admin in-room clients should not auto-start unless forced by server/admin
+    if (state.inRoom && !state.isAdmin && !force) {
+      // preload but do not autoplay
+      await preload(u).catch(()=>{});
+      state.playing = false;
+      return false;
+    }
+    // Ensure audio context exists for decoded playback
+    try { ensureAudioCtx(); } catch(e){}
+    const ok = await _playUrl(u, vol, { loop: true });
+    state.playing = !!ok;
+    return ok;
+  }
+
+  function startGame() { return start(state.url, { force: false, vol: state.vol }); }
+
+  // Stop music; if force=true, always stop. Otherwise respect that non-admin room users may have not started.
+  function stop({ force = false } = {}) {
+    if (!state.playing && !force) {
+      // still attempt minimal teardown of decoded buffer
+      try { stopDecodedBgm(); } catch(e){}
+      state.playing = false;
+      return;
+    }
+    try {
+      stopAllAudio();
+    } catch (e) { console.warn('musicController.stop failed', e); }
+    state.playing = false;
+  }
+  function stopGame() { stop({ force: false }); }
+
+  function isPlaying() { return !!state.playing; }
 
   return {
-    setEnabled,
-    start,
-    stop,
-    preload,
+    preload: (u) => preload(u),
     setRoomState,
-    onRoomUpdate,
-    onGameBegin,
-    getState: () => ({ enabled: _enabled, bgmUrl: _bgmUrl, isAdmin: _isAdmin, inRoom: _inRoom })
+    start,
+    startGame,
+    stop,
+    stopGame,
+    isPlaying,
+    getState
   };
 })();
 
@@ -1203,6 +1528,57 @@ function stopDecodedBgm() {
     decodedBgmNode = null;
     decodedBgmPlaying = false;
   } catch (e) {}
+}
+
+/*
+  Safety wrappers: prevent scattered code from directly starting/stopping BGM
+  outside the centralized musicController policy. These wrappers prefer the
+  musicController API when available, but fall back to the original behavior
+  to preserve compatibility.
+*/
+try {
+  // Wrap playDecodedBgm so callers that directly start decoded buffers are
+  // routed through the musicController (ensures consistent policy and stop).
+  const _origPlayDecodedBgm = typeof playDecodedBgm === 'function' ? playDecodedBgm : null;
+  playDecodedBgm = function(url, opts) {
+    try {
+      const mc = window.__handNinja && window.__handNinja.musicController;
+      const volume = opts && typeof opts.vol === 'number' ? opts.vol : 0.8;
+      // Only divert BGM-style urls (the project's ASSETS.bgm) to the controller.
+      // For other arbitrary decoded plays preserve original behavior when possible.
+      const isLikelyBgm = (ASSETS && ASSETS.bgm && url && url === ASSETS.bgm) || (typeof url === 'string' && /bgm/i.test(url));
+      if (mc && typeof mc.start === 'function' && isLikelyBgm) {
+        // Use controller and force play when callers requested direct start
+        mc.start(url, { force: true, vol: volume }).catch(() => {});
+        return true;
+      }
+    } catch (e) {
+      console.warn('playDecodedBgm wrapper failed', e);
+    }
+    // fallback to original implementation if available
+    try { if (_origPlayDecodedBgm) return _origPlayDecodedBgm(url, opts); } catch(e){}
+    return false;
+  };
+
+  // Wrap stopDecodedBgm to prefer controller stop path which performs more
+  // complete teardown across playback backends.
+  const _origStopDecodedBgm = typeof stopDecodedBgm === 'function' ? stopDecodedBgm : null;
+  stopDecodedBgm = function() {
+    try {
+      const mc = window.__handNinja && window.__handNinja.musicController;
+      if (mc && typeof mc.stop === 'function') {
+        // force stop via controller so it tears down all sources consistently
+        try { mc.stop({ force: true }); } catch(e){}
+        return;
+      }
+    } catch (e) {
+      console.warn('stopDecodedBgm wrapper failed', e);
+    }
+    try { if (_origStopDecodedBgm) return _origStopDecodedBgm(); } catch(e){}
+  };
+} catch (e) {
+  // Defensive: if wrappers fail, continue without breaking the rest of the script.
+  console.warn('BGM wrapper installation failed', e);
 }
 
  // Preload and decode a short SFX into an AudioBuffer
@@ -1614,28 +1990,43 @@ async function preloadAssets() {
           // Ensure loop on discovered element
           a.loop = true;
 
-          // Teardown any existing bgm BEFORE assigning the new instance to avoid races/duplicate playback.
-          if (bgmAudio && bgmAudio !== a) {
-            try { reportStatus('bgm', `teardown prev ${bgmAudio && bgmAudio.src ? bgmAudio.src : '<none>'} at ${Date.now()}`); } catch(e){}
-            try { bgmAudio.pause(); } catch(e){}
-            try { bgmAudio.currentTime = 0; } catch(e){}
+          // If a centralized musicController exists, prefer it for BGM lifecycle management.
+          // We still keep a diagnostic reference to the discovered element but avoid assigning
+          // it as the active playback source so we don't bypass controller policy (preload vs start).
+          const mc = window.__handNinja && window.__handNinja.musicController;
+          if (mc && typeof mc.preload === 'function') {
             try {
-              // preserve previous src so we can revoke blob URLs after clearing
-              const _prevSrc = bgmAudio.src;
-              try { bgmAudio.src = ''; } catch(e){}
-              try { bgmAudio.removeAttribute && bgmAudio.removeAttribute('src'); } catch(e){}
-              try { bgmAudio.load && bgmAudio.load(); } catch(e){}
-              if (_prevSrc && typeof _prevSrc === 'string' && _prevSrc.indexOf('blob:') === 0) {
-                try { URL.revokeObjectURL(_prevSrc); } catch(e){}
-              }
-            } catch(e){}
-            try { delete soundPool.bgm; } catch(e){}
-          }
+              mc.preload(a.src).catch(()=>{});
+              try { soundPool.bgm = a; } catch(e){}
+              reportStatus('bgm', `preloaded via musicController ${a.src}`);
+            } catch (e) {
+              // fall back to legacy assignment below on unexpected controller errors
+              console.warn('musicController.preload failed, falling back to legacy bgm assignment', e);
+            }
+          } else {
+            // Teardown any existing bgm BEFORE assigning the new instance to avoid races/duplicate playback.
+            if (bgmAudio && bgmAudio !== a) {
+              try { reportStatus('bgm', `teardown prev ${bgmAudio && bgmAudio.src ? bgmAudio.src : '<none>'} at ${Date.now()}`); } catch(e){}
+              try { bgmAudio.pause(); } catch(e){}
+              try { bgmAudio.currentTime = 0; } catch(e){}
+              try {
+                // preserve previous src so we can revoke blob URLs after clearing
+                const _prevSrc = bgmAudio.src;
+                try { bgmAudio.src = ''; } catch(e){}
+                try { bgmAudio.removeAttribute && bgmAudio.removeAttribute('src'); } catch(e){}
+                try { bgmAudio.load && bgmAudio.load(); } catch(e){}
+                if (_prevSrc && typeof _prevSrc === 'string' && _prevSrc.indexOf('blob:') === 0) {
+                  try { URL.revokeObjectURL(_prevSrc); } catch(e){}
+                }
+              } catch(e){}
+              try { delete soundPool.bgm; } catch(e){}
+            }
 
-          // Register the new bgm element (single assignment)
-          bgmAudio = a;
-          try { soundPool.bgm = a; } catch(e){}
-          try { reportStatus('bgm', `loaded ${a.src} at ${Date.now()}`); } catch(e){}
+            // Register the new bgm element (single assignment)
+            bgmAudio = a;
+            try { soundPool.bgm = a; } catch(e){}
+            try { reportStatus('bgm', `loaded ${a.src} at ${Date.now()}`); } catch(e){}
+          }
 
           // Decode bgm into WebAudio buffer in background (no autoplay).
           // Use preloadSfx to leverage existing decode logic / AudioContext handling.
@@ -2585,107 +2976,88 @@ function playFatSound(soundName, options = {}) {
 }
 
 function setMusicEnabled(v) {
-  // Debounced, consolidated music toggle to avoid rapid stop/start thrash.
+  // Simplified centralized music toggle:
+  // - always persist preference
+  // - disabling stops all audio immediately
+  // - enabling preloads when idle, starts immediately if a game is running
   try {
-    const wasEnabled = !!musicEnabled;
+    const prev = !!musicEnabled;
     musicEnabled = !!v;
-    console.log(`Music toggled: wasEnabled=${wasEnabled}, nowEnabled=${musicEnabled}`);
+    console.log(`Music toggled: wasEnabled=${prev}, nowEnabled=${musicEnabled}`);
   } catch (e) {
     musicEnabled = !!v;
   }
 
-  // immediate UI feedback for room users (non-blocking)
-  try {
-    const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-    if (roomsState && roomsState.room && !roomsState.isAdmin && musicEnabled) {
-      try {
-        if (noticeEl) {
-          noticeEl.textContent = 'Music preference saved — waiting for room admin to start BGM';
-          setTimeout(() => { try { noticeEl.textContent = ''; } catch (e) {} }, 2200);
-        }
-      } catch (e) {}
-    }
-  } catch (e) {}
+  // sync UI and persist preference
+  try { syncMusicCheckboxes(musicEnabled); } catch (e) {}
+  try { localStorage.setItem('hand_ninja_music_enabled', musicEnabled ? '1' : '0'); } catch (e) {}
 
-  // Store desired state and debounce applying it to avoid quick toggles causing audio artifacts.
-  try {
-    setMusicEnabled._pending = !!musicEnabled;
-    if (setMusicEnabled._debounceTimer) clearTimeout(setMusicEnabled._debounceTimer);
-    setMusicEnabled._debounceTimer = setTimeout(() => {
-      try {
-        // Always stop everything first to ensure a clean state before applying change
-        // when it's safe to do so (solo or admin).
-        try {
-          const roomsStateInner = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-          const inRoom = roomsStateInner && roomsStateInner.room;
-          const isAdmin = roomsStateInner && roomsStateInner.isAdmin;
-          // Non-admins in a room should not teardown/start audio when toggling; preserve admin/solo behavior.
-          if (!inRoom || isAdmin) {
-            try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
-          } else {
-            // For non-admin room users, just record preference and give feedback.
-            if (!setMusicEnabled._pending) {
-              // if user explicitly disabled while in-room, stop what they can locally
-              try { stopAllAudio(); } catch (e) {}
-            }
-          }
-        } catch (innerE) {
-          try { stopAllAudio(); } catch (e) { console.warn('stopAllAudio failed during setMusicEnabled', e); }
-        }
+  // Immediate disable path: stop everything
+  if (!musicEnabled) {
+    try {
+      // Prefer controller stop when available
+      const mc = window.__handNinja && window.__handNinja.musicController;
+      if (mc && typeof mc.stop === 'function') {
+        try { mc.stop({ force: true }); } catch (e) {}
+      }
+    } catch (e) {}
+    try { stopAllAudio(); } catch (e) {}
+    try { if (noticeEl) { noticeEl.textContent = 'Music disabled'; setTimeout(() => { noticeEl.textContent = ''; }, 1200); } } catch (e) {}
+    return;
+  }
 
-        const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+  // Enabling: decide between immediate start (if running) or preload-only (if idle)
+  const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
+  const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+  const inRoom = !!(roomsState && roomsState.room);
+  const isAdmin = !!(roomsState && roomsState.isAdmin);
 
-        if (setMusicEnabled._pending) {
-          // If the client is inside a room and is NOT the admin, do NOT start local BGM.
-          // The room admin's selection (server-driven) is authoritative and will force playback
-          // for all clients via game_begin handlers. Provide visible feedback instead.
-          if (roomsState && roomsState.room && !roomsState.isAdmin) {
-            console.log('Music enabled locally but waiting for room admin to pick/start BGM');
+  if (running) {
+    // If a game is actively running, start music now (respecting server/admin policy inside controller).
+    try {
+      if (mc && typeof mc.setRoomState === 'function') {
+        try { mc.setRoomState({ inRoom, isAdmin }); } catch (e) {}
+      }
+      if (mc && typeof mc.startGame === 'function') {
+        mc.startGame().catch(() => {});
+      } else {
+        // fallback: try decoded play or legacy playSound
+        try { ensureAudioCtx(); } catch (e) {}
+        if (ASSETS && ASSETS.bgm) {
+          decodeBgmBuffer(ASSETS.bgm).then(buf => {
             try {
-              if (noticeEl) {
-                noticeEl.textContent = 'Music preference saved — waiting for room admin';
-                setTimeout(() => { try { noticeEl.textContent = ''; } catch (e) {} }, 1800);
+              if (buf) {
+                playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true });
+              } else {
+                playSound('bgm');
               }
             } catch (e) {}
-          } else {
-            // Not in a room or is admin: safe to start local BGM.
-            try { ensureAudioCtx(); } catch (e) { /* ignore */ }
-
-            // Small safety delay to allow audio tear-down to complete in some browsers.
-            setTimeout(() => {
-              try {
-                playSound('bgm');
-              } catch (err) {
-                console.warn('Failed to start BGM after enabling music', err);
-              }
-            }, 120);
-          }
+          }).catch(() => { try { playSound('bgm'); } catch (e) {} });
         } else {
-          // Disabled: ensure everything is stopped immediately.
-          console.log('Music disabled - all audio stopped');
-          try { if (noticeEl) { noticeEl.textContent = 'Music disabled'; setTimeout(()=>{ try{ noticeEl.textContent=''; }catch(e){} }, 1200); } } catch(e){}
+          try { playSound('bgm'); } catch (e) {}
         }
-      } catch (e) {
-        console.warn('setMusicEnabled apply failed', e);
-      } finally {
-        setMusicEnabled._debounceTimer = null;
-        setMusicEnabled._pending = null;
       }
-    }, 180);
-  } catch (e) {
-    console.warn('setMusicEnabled scheduling failed', e);
-    // Fallback immediate apply
-    try { stopAllAudio(); } catch(e){}
-    if (musicEnabled) {
-      try { ensureAudioCtx(); } catch(e){}
-      // Only start if not in a room or is admin (best-effort)
-      const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-      if (!roomsState || !roomsState.room || roomsState.isAdmin) {
-        try { playSound('bgm'); } catch(e){}
-      } else {
-        console.log('Music enabled but in-room non-admin; waiting for admin to start BGM');
-      }
+      try { if (noticeEl) { noticeEl.textContent = 'Music enabled'; setTimeout(() => { noticeEl.textContent = ''; }, 1400); } } catch (e) {}
+    } catch (e) {
+      console.warn('Failed to start music on enable', e);
     }
+    return;
+  }
+
+  // Not running: preload/decode BGM but do not auto-play
+  try {
+    if (mc && typeof mc.setRoomState === 'function') {
+      try { mc.setRoomState({ inRoom, isAdmin }); } catch (e) {}
+    }
+    if (mc && typeof mc.preload === 'function') {
+      mc.preload(ASSETS && ASSETS.bgm).catch(() => {});
+    } else if (ASSETS && ASSETS.bgm) {
+      // best-effort decode into WebAudio without starting playback
+      decodeBgmBuffer(ASSETS.bgm).catch(() => {});
+    }
+    try { if (noticeEl) { noticeEl.textContent = 'Music enabled — will play when a game starts'; setTimeout(() => { noticeEl.textContent = ''; }, 1800); } } catch (e) {}
+  } catch (e) {
+    console.warn('Failed to preload BGM on enable', e);
   }
 }
 
@@ -2714,6 +3086,195 @@ function rand(a, b) {
 }
 function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
 
+// Client-side deterministic item generator (matches server generator)
+// Returns an array of items: { id, type, x, y, vx, vy, r, spawnTime }
+function generateGameItems(gameType, seed) {
+  const items = [];
+  let s = Number(seed) >>> 0;
+  function localRand() {
+    s |= 0;
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+
+  if (!gameType) gameType = 'ninja-fruit';
+    if (gameType === 'ninja-fruit' || gameType === 'fruit' || gameType === 'ninja') {
+    // Solo baseline reduced to 25-50 items to avoid overly dense generation.
+    // Multiplayer (serverAuthoritative) fallback will apply SERVER_SPAWN_MULTIPLIER
+    // so clients generate roughly half (or configured multiplier) of the solo set.
+    // Ensure we generate enough items to reasonably cover the whole game duration.
+    // Base solo count remains 25-50, but also ensure a minimum based on duration / spawn interval.
+    let numItems = 25 + Math.floor(localRand() * 25); // 25-50 items (solo baseline)
+
+    // Compute a duration-based desired minimum so spawns continue throughout the run.
+    const gameDurationMs = (typeof gameLengthEl !== 'undefined' && gameLengthEl && Number(gameLengthEl.value))
+      ? Math.max(3000, Number(gameLengthEl.value) * 1000)
+      : (typeof duration === 'number' ? Math.max(3000, duration * 1000) : 45000);
+
+    try {
+      // desired count roughly equals duration divided by fruit spawn interval (allow some slack)
+      const desiredByInterval = Math.max(6, Math.ceil(gameDurationMs / Math.max(1200, FRUIT_SPAWN_INTERVAL) * 1.05));
+      numItems = Math.max(numItems, desiredByInterval);
+
+      if (typeof serverAuthoritative !== 'undefined' && serverAuthoritative) {
+        const adjustedMultiplier = Math.max(0.01, SERVER_SPAWN_MULTIPLIER);
+        // Ensure we always generate a small minimum so late-joiners still see some content.
+        numItems = Math.max(4, Math.round(numItems * adjustedMultiplier));
+      }
+    } catch (e) { /* ignore */ }
+
+    for (let i = 0; i < numItems; i++) {
+      // In multiplayer fallbacks make bombs rarer
+      let isBomb = (localRand() > 0.82);
+      try {
+        if (typeof serverAuthoritative !== 'undefined' && serverAuthoritative) {
+          // reduce bomb frequency for multiplayer fallback (rarer than solo)
+          // make bombs even rarer in multiplayer fallbacks to reduce negative UX (approx ~6-8%)
+          isBomb = (localRand() > 0.94);
+        }
+      } catch (e) { /* ignore */ }
+
+      const x = 0.08 + localRand() * 0.84; // normalized X (0..1)
+      const y = 1.05; // spawn slightly below bottom (normalized)
+      const vx = (localRand() - 0.5) * 0.4; // normalized lateral velocity
+      const vy = -0.012 - (localRand() * 0.006); // normalized upward velocity
+      const r = 26 + Math.floor(localRand() * 18);
+
+      // Keep most spawns inside the full game duration so items continue appearing until game end
+      const spawnWindow = Math.max(3000, Math.floor(gameDurationMs));
+      // Distribute items evenly across the spawnWindow with a small per-item jitter.
+      const spawnTime = Math.floor((i / Math.max(1, numItems - 1)) * spawnWindow + localRand() * Math.min(500, Math.floor(spawnWindow / Math.max(10, numItems))));
+      items.push({
+        id: `item_${i}_${String(seed || 0)}`,
+        type: isBomb ? 'bomb' : 'fruit',
+        x, y, vx, vy, r,
+        spawnTime
+      });
+    }
+  }
+
+  return items;
+}
+
+// Convert a scheduled item into an in-game object and push to `objects`
+function createObjectFromItem(item) {
+  try {
+    const w = canvas.width / DPR;
+    const h = canvas.height / DPR;
+    let x = (typeof item.x === 'number') ? item.x : (Math.random() * (w - 60) + 30);
+    let y = (typeof item.y === 'number') ? item.y : (h + 20);
+    // if normalized coords (0..1-ish), convert to pixels
+    if (x <= 1.05 && x >= -0.05) x = x * w;
+    if (y <= 2.5) y = y * h;
+
+    // velocities: if provided as small normalized numbers, scale to px/s
+    // Accept both server-side names (velX/velY) and client-side (vx/vy).
+    // Fall back to random toss if neither provided.
+    let vx = (typeof item.vx === 'number') ? item.vx : ((typeof item.velX === 'number') ? item.velX : rand(-220, 220));
+    let vy = (typeof item.vy === 'number') ? item.vy : ((typeof item.velY === 'number') ? item.velY : rand(-1600, -1100));
+
+    // If server provided normalized small velocities (0..1), scale them to px/s.
+    if (Math.abs(vx) <= 1.0) vx = vx * Math.max(120, w * 0.6);
+    // For vy also map small normalized values to a playable upward velocity.
+    if (Math.abs(vy) <= 1.0) {
+      vy = (typeof serverAuthoritative !== 'undefined' && serverAuthoritative) ? rand(-1200, -900) : rand(-1600, -1100);
+    }
+
+    // Honor an optional per-item gravity multiplier provided by the server.
+    // Store a gravityFactor on the object which the physics loop will consult.
+    const gravityFactor = (typeof item.gravity === 'number' && isFinite(item.gravity)) ? Number(item.gravity) : null;
+
+    const r = Number(item.r) || randInt(28, 44);
+
+    const obj = {
+      id: item.id || (crypto && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)),
+      type: item.type === 'bomb' ? 'bomb' : 'fruit',
+      x, y, vx, vy,
+      r,
+      ang: rand(0, Math.PI * 2),
+      spin: rand(-3, 3),
+      color: item.color || `hsl(${randInt(10,140)},70%,55%)`,
+      sprite: item.sprite || null,
+      sliced: false
+    };
+
+    if (obj.type === 'bomb') {
+      obj.color = item.color || '#111';
+      obj.fusePhase = Math.random() * Math.PI * 2;
+    }
+
+    objects.push(obj);
+    return obj;
+  } catch (e) {
+    console.warn('createObjectFromItem failed', e);
+    return null;
+  }
+}
+
+/*
+  Process scheduledGameItems against a wall-clock timestamp (Date.now()).
+  Throttle actual creation to avoid huge bursts when many scheduled items become due
+  (common when joining late or when authoritative server emits many items at once).
+  Also respect conservative per-type concurrency caps when running in server-authoritative mode.
+*/
+function processScheduledSpawns(nowMs) {
+  try {
+    if (!serverStartEpoch || !Array.isArray(scheduledGameItems) || scheduledGameItems.length === 0) return;
+
+    // per-frame spawn cap to avoid huge simultaneous bursts
+    let spawnedThisFrame = 0;
+    // In multiplayer (server-authoritative) reduce the burst allowance so late-join floods
+    // don't create large simultaneous bursts. In solo play allow a slightly larger per-frame burst.
+    const MAX_SPAWN_PER_FRAME = (serverAuthoritative) ? 1 : 3; // tuneable: how many scheduled items we allow to create per frame
+
+    // track how many of each type we spawned this frame to compute "current" count with pending spawns
+    const spawnedThisFrameForType = { fruit: 0, bomb: 0 };
+
+    // current on-screen counts (base)
+    const currFruitCount = objects.filter(o => o.type === 'fruit').length;
+    const currBombCount = objects.filter(o => o.type === 'bomb').length;
+
+    for (const it of scheduledGameItems) {
+      if (spawnedThisFrame >= MAX_SPAWN_PER_FRAME) break;
+      if (!it || it._spawned) continue;
+      const spawnAt = (typeof it.spawnTime === 'number') ? (serverStartEpoch + Number(it.spawnTime)) : null;
+      if (!spawnAt) continue;
+      if (nowMs < spawnAt) continue;
+
+      // determine type and effective cap
+      const type = (it.type === 'bomb') ? 'bomb' : 'fruit';
+      const baseMax = (type === 'fruit') ? MAX_FRUITS : MAX_BOMBS;
+      // Apply server-authoritative multiplier to reduce on-screen concurrency for multiplayer rooms.
+      const effectiveMax = (serverAuthoritative)
+        // Ensure multiplayer caps are reduced but never drop to 0 when the base cap is > 0.
+        // Use a slightly higher minimum so gameplay doesn't starve (keep at least 2 when baseMax > 0).
+        ? Math.max((baseMax > 0 ? 2 : 0), Math.floor(baseMax * SERVER_SPAWN_MULTIPLIER))
+        : baseMax;
+
+      // compute current count including the spawns we will make this frame
+      // (use the safe per-type counters; guard against legacy typos)
+      const currentCountSafe = (type === 'fruit')
+        ? (currFruitCount + (spawnedThisFrameForType.fruit || 0))
+        : (currBombCount + (spawnedThisFrameForType.bomb || 0));
+
+      // If we already reached the cap for this type, defer spawning (leave _spawned false so it will be retried later)
+      if (currentCountSafe >= effectiveMax) {
+        continue;
+      }
+
+      // create object and mark spawned
+      createObjectFromItem(it);
+      it._spawned = true;
+      spawnedThisFrame++;
+      spawnedThisFrameForType[type] = (spawnedThisFrameForType[type] || 0) + 1;
+    }
+  } catch (e) {
+    console.warn('processScheduledSpawns error', e);
+  }
+}
+
 // Resize canvas to match window
 function resizeCanvas() {
   canvas.width = Math.floor(canvas.clientWidth * DPR);
@@ -2722,6 +3283,30 @@ function resizeCanvas() {
 }
 new ResizeObserver(resizeCanvas).observe(canvas);
 resizeCanvas();
+
+// Pointer/tap support: allow direct tapping on fruits/bombs to slice (improves touch UX)
+try {
+  canvas.addEventListener('pointerdown', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    // map CSS pixels -> canvas logical pixels (account for DPR and potential CSS scaling)
+    const x = (cssX * (canvas.width / rect.width)) / DPR;
+    const y = (cssY * (canvas.height / rect.height)) / DPR;
+
+    for (let i = objects.length - 1; i >= 0; i--) {
+      const obj = objects[i];
+      if (!obj) continue;
+      const dx = obj.x - x;
+      const dy = obj.y - y;
+      if (Math.hypot(dx, dy) <= (obj.r || 0) + HIT_PADDING) {
+        try { handleHit(obj, { x, y }); } catch (e) {}
+        try { e.preventDefault(); } catch (e) {}
+        break;
+      }
+    }
+  }, { passive: false });
+} catch (e) {}
 
 // Helpers: cover-scale mapping so overlays match video drawn using "cover"
 function computeCoverTransform(iw, ih, cw, ch) {
@@ -2737,11 +3322,18 @@ function mapLandmarksToCanvas(landmarks, results) {
   const ih = results.image.height || results.image.videoHeight || canvas.height;
   const cw = canvas.width / DPR, ch = canvas.height / DPR;
   const t = computeCoverTransform(iw, ih, cw, ch);
-  return landmarks.map(lm => ({
-    x: t.dx + lm.x * iw * t.scale,
-    y: t.dy + lm.y * ih * t.scale,
-    z: lm.z
-  }));
+  // TRUE MIRROR MODE: Force mirror transformation for all hand landmarks to match camera
+  return landmarks.map(lm => {
+    const lx = (typeof lm.x === 'number') ? lm.x : 0;
+    const ly = (typeof lm.y === 'number') ? lm.y : 0;
+    // Always apply mirror flip (1 - lx) to match the forced camera mirror mode
+    const px = 1 - lx;
+    return {
+      x: t.dx + px * iw * t.scale,
+      y: t.dy + ly * ih * t.scale,
+      z: lm.z
+    };
+  });
 }
 
  // Generate random shape outlines (returns { points: [{x,y}], type })
@@ -2910,14 +3502,22 @@ function generateRandomShape() {
 }
 
 // spawn fruit and bomb
-function spawnFruit() {
-  if (objects.filter(o => o.type === 'fruit').length >= MAX_FRUITS) return;
+ function spawnFruit(opts) {
+   opts = opts || {};
+   // Reduce local spawn caps when running in server-authoritative (multiplayer) mode.
+   // If forceLocal is set, treat this spawn as a local fallback and use normal local caps.
+   const effectiveMax = (serverAuthoritative && !opts.forceLocal)
+     // In multiplayer reduce visible fruits but keep at least two when base cap > 0 to avoid starvation.
+     ? Math.max((MAX_FRUITS > 0 ? 2 : 0), Math.floor(MAX_FRUITS * SERVER_SPAWN_MULTIPLIER))
+     : MAX_FRUITS;
+   if ((objects.filter(o => o.type === 'fruit').length) >= effectiveMax) return;
+
   const radius = randInt(28, 44);
   const x = rand(radius, canvas.width / DPR - radius);
   const y = canvas.height / DPR + radius + 10;
   const vx = rand(-220, 220);
-  // much stronger upward throw so fruits go very high
-  const vy = rand(-1600, -1100);
+  // slightly gentler upward throw on multiplayer fallbacks to reduce clutter
+  const vy = serverAuthoritative ? rand(-1200, -900) : rand(-1600, -1100);
   const color = `hsl(${randInt(10,140)},70%,55%)`;
 
   // pick a sprite if available
@@ -2939,14 +3539,22 @@ function spawnFruit() {
   });
 }
 
-function spawnBomb() {
-  if (objects.filter(o => o.type === 'bomb').length >= MAX_BOMBS) return;
+ function spawnBomb(opts) {
+   opts = opts || {};
+   // Reduce bomb concurrency in multiplayer/fallback cases.
+   // If forceLocal is set, use normal local caps so fallback spawns can show a playable number of bombs.
+   const effectiveMax = (serverAuthoritative && !opts.forceLocal)
+     // In multiplayer reduce visible bombs but keep at least two when base cap > 0 to avoid starvation.
+     ? Math.max((MAX_BOMBS > 0 ? 2 : 0), Math.floor(MAX_BOMBS * SERVER_SPAWN_MULTIPLIER))
+     : MAX_BOMBS;
+   if ((objects.filter(o => o.type === 'bomb').length) >= effectiveMax) return;
+
   const radius = randInt(26, 36);
   const x = rand(radius, canvas.width / DPR - radius);
   const y = canvas.height / DPR + radius + 10;
   const vx = rand(-150, 150);
-  // bombs match fruit height (strong upward throw)
-  const vy = rand(-1600, -1100);
+  // slightly gentler upward throw for bombs in multiplayer fallback
+  const vy = serverAuthoritative ? rand(-1200, -900) : rand(-1600, -1100);
   objects.push({
     id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2),
     type: 'bomb',
@@ -2991,19 +3599,30 @@ function drawVideoFrame(image) {
   ctx.fillStyle = '#000';
   ctx.fillRect(0,0,cw,ch);
 
-  // draw video scaled to cover
+  // Stabilize brightness by applying a subtle filter (prevent flickering)
   ctx.save();
+  ctx.filter = 'brightness(1.02) contrast(1.05)'; // Slight stabilization
+
+  // TRUE MIRROR MODE: Force horizontal flip for consistent mirror behavior like a real mirror
   ctx.translate(t.dx, t.dy);
   ctx.scale(t.scale, t.scale);
+  // Always force mirror - left/right swapped like a real mirror regardless of camera or MediaPipe settings
+  ctx.translate(iw, 0);
+  ctx.scale(-1, 1);
   ctx.drawImage(image, 0, 0, iw, ih);
   ctx.restore();
+
+  // Reset filter for other rendering
+  ctx.filter = 'none';
 }
 
 function drawObjects(dt) {
   for (let i = objects.length - 1; i >= 0; i--) {
     const o = objects[i];
     // physics
-    o.vy += GRAVITY * dt;
+    // Per-object gravity: if an object carries a gravityFactor (from server), apply it as a multiplier.
+    const gMult = (typeof o.gravityFactor === 'number' && isFinite(o.gravityFactor)) ? Number(o.gravityFactor) : 1;
+    o.vy += GRAVITY * gMult * dt;
     o.x += o.vx * dt;
     o.y += o.vy * dt;
     o.ang += o.spin * dt;
@@ -3206,9 +3825,29 @@ function spawnPopup(x,y,text,opts={}) {
     popups.shift();
   }
 
+  // Ensure popup text is always a sensible string (avoid `undefined`, `null` or "?" artifacts)
+  let popupText = '';
+  try {
+    if (typeof text === 'number') popupText = String(text);
+    else if (typeof text === 'string') popupText = text.trim();
+    else if (text === null || typeof text === 'undefined') popupText = '';
+    else popupText = String(text);
+
+    // Normalize ambiguous single-character or punctuation-only placeholders into 'Miss'.
+    // Preserve score-like strings (e.g. "+10", "-5") and numeric strings.
+    try {
+      const tnorm = popupText.trim();
+      if (tnorm === '?') popupText = 'Miss';
+      else if (/^[^0-9A-Za-z+\-]{1,3}$/.test(tnorm)) popupText = 'Miss';
+    } catch (innerE) { /* ignore normalization errors */ }
+
+  } catch (e) { popupText = ''; }
+  // Do not spawn empty popups
+  if (!popupText || popupText.trim().length === 0) return;
+
   popups.push({
     x, y,
-    text: String(text),
+    text: popupText,
     vx: rand(-40,40),
     vy: rand(-120, -40),
     life: opts.life || 0.9,
@@ -3253,28 +3892,200 @@ function drawPopups(dt) {
 
 // scoring and hit handling
 function handleHit(obj, hitPoint) {
-  if (obj.sliced) return;
+  // Deduplicate rapid hits / in-flight interactions
+  if (obj.sliced || obj._tentativeRemove || obj._pendingInteraction) return;
+
+  // Helper to format optimistic popup text consistently
+  const formatDelta = (delta) => (delta > 0) ? `+${delta}` : `${delta}`;
+
+  // Server-authoritative optimistic flow
+  if (serverAuthoritative) {
+    const canSend = !!(window.NET && typeof window.NET.sendInteractionImmediate === 'function');
+
+    // coords
+    const cw = canvas.width / DPR;
+    const ch = canvas.height / DPR;
+    const hx = (hitPoint && typeof hitPoint.x === 'number') ? hitPoint.x : obj.x;
+    const hy = (hitPoint && typeof hitPoint.y === 'number') ? hitPoint.y : obj.y;
+    const nx = Math.max(0, Math.min(1, hx / cw));
+    const ny = Math.max(0, Math.min(1, hy / ch));
+    const fx = hx, fy = hy;
+
+    const optimisticDelta = (obj.type === 'bomb') ? -20 : 10;
+    const optimisticPopupText = formatDelta(optimisticDelta);
+
+    // Apply optimistic visual + score immediately
+    obj._pendingInteraction = !!canSend;
+    obj._optimisticScore = optimisticDelta;
+    score = Math.max(0, score + optimisticDelta);
+    updateUI();
+
+    // Mark sliced locally to prevent duplicate hits and give immediate visual feedback.
+    // We remove the object locally shortly after to keep UX responsive; the server will
+    // still reconcile authoritative state and scores.
+    try {
+      obj.sliced = true;
+      setTimeout(() => {
+        try {
+          const idx = objects.findIndex(o => o.id === obj.id);
+          if (idx !== -1) objects.splice(idx, 1);
+        } catch (e) {}
+      }, 80);
+    } catch (e) {}
+
+    // visual/audio feedback
+    if (obj.type === 'bomb') {
+      spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 12);
+      spawnPopup(fx, fy, optimisticPopupText, { col: 'rgba(255,80,80,0.95)', size: 18 });
+      try { playSound('bomb'); } catch(e){}
+    } else {
+      spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 8);
+      spawnPopup(fx, fy, optimisticPopupText, { col: 'rgba(255,240,200,1)', size: 16 });
+      try { playSound('slice'); } catch(e){}
+    }
+
+    obj._tentativeRemove = true;
+
+    // If we cannot reach server, resolve locally (keep optimistic score)
+    if (!canSend) {
+      try {
+        obj.sliced = true;
+        setTimeout(() => {
+          const idx = objects.findIndex(o => o.id === obj.id);
+          if (idx !== -1) objects.splice(idx, 1);
+        }, 80);
+      } catch (e) {}
+      return;
+    }
+
+    // Send interaction intent with tolerant reconciliation
+    try {
+      // safety timer to avoid permanent pending state
+      try {
+        obj._optimisticTimer = setTimeout(() => {
+          if (obj && obj._pendingInteraction) {
+            obj._pendingInteraction = false;
+            obj._optimisticTimer = null;
+          }
+        }, 5000);
+      } catch (e) {}
+
+      NET.sendInteractionImmediate({ objectId: obj.id, x: nx, y: ny }, (res) => {
+        obj._pendingInteraction = false;
+        try { clearTimeout(obj._optimisticTimer); } catch(e){}
+
+        // No server response -> keep optimistic result (avoid false "Miss" on flaky networks)
+        if (!res) {
+          updateUI();
+          return;
+        }
+
+        // Explicit success from server -> adopt authoritative score if provided
+        if (res && res.ok === true) {
+          if (typeof res.score === 'number') {
+            score = Number(res.score);
+            updateUI();
+          } else {
+            updateUI();
+          }
+          obj._optimisticScore = 0;
+          return;
+        }
+
+        // If server returned a non-success but we're in server-authoritative multiplayer,
+        // be tolerant: keep optimistic visuals/score to avoid confusing "Miss" for players.
+        // Preserve the optimistic popup/score and simply clear the pending flag so the UI
+        // does not revert to a confusing "Miss" or a fallback '?' label on flaky networks.
+        if (serverAuthoritative) {
+          try { clearTimeout(obj._optimisticTimer); } catch (e) {}
+          // Clear the pending flag but keep tentative remove/sliced state so optimistic visuals remain.
+          obj._pendingInteraction = false;
+          // Do NOT flip _tentativeRemove or obj.sliced here; they represent the optimistic visual state.
+          // Leave obj._optimisticScore intact so the score display/popup persists until authoritative confirmation.
+          updateUI();
+          return;
+        }
+
+        // Non-authoritative flows: preserve previous "not found" tolerant logic, otherwise revert and show Miss
+        const reason = (res.reason || res.message || '').toString().toLowerCase();
+        const code = (res.code || '').toString().toLowerCase();
+        const status = Number(res.status || res.statusCode || 0);
+        const treatAsNotFound = (typeof reason === 'string' && /not\s*found|unknown|missing/i.test(reason)) ||
+                                (typeof code === 'string' && /not[_-]?found|unknown|missing|unknown_object/i.test(code)) ||
+                                status === 404 || status === 410;
+
+        if (treatAsNotFound) {
+          try {
+            obj.sliced = true;
+            setTimeout(() => {
+              const idx2 = objects.findIndex(o => o.id === obj.id);
+              if (idx2 !== -1) objects.splice(idx2, 1);
+            }, 80);
+          } catch (e) {}
+          try { clearTimeout(obj._optimisticTimer); } catch(e){}
+          obj._pendingInteraction = false;
+          obj._tentativeRemove = false;
+          updateUI();
+          return;
+        }
+
+        // Genuine rejection in non-authoritative mode: undo optimistic score and show Miss only when server explicitly rejected.
+        try {
+          const optimistic = Number(obj._optimisticScore || 0);
+          if (optimistic && typeof score === 'number') {
+            score = Math.max(0, Math.round(score - optimistic));
+          }
+        } catch (e) {}
+        obj._tentativeRemove = false;
+        obj._optimisticScore = 0;
+        obj.sliced = false;
+        // Only display a visible "Miss" when the server provided an explicit rejection payload.
+        // Avoid showing "Miss" on flaky/absent responses to prevent confusing UX.
+        const serverRejected = (res && (res.ok === false || (res.status && Number(res.status) >= 400) || res.reason || res.code));
+        if (serverRejected) {
+          spawnPopup(fx, fy, 'Miss', { col: 'red', size: 14 });
+          try { playSound('wrong'); } catch (e) {}
+        } else {
+          // Silent revert: keep UX calm on ambiguous/falsy responses
+          try { playSound && playSound('wrong'); } catch(e) { /* but avoid popup */ }
+        }
+        updateUI();
+      });
+    } catch (e) {
+      // synchronous send error -> fallback to local removal but keep optimistic visuals/score
+      obj._pendingInteraction = false;
+      try { clearTimeout(obj._optimisticTimer); } catch (e) {}
+      try {
+        obj.sliced = true;
+        setTimeout(() => {
+          const idx = objects.findIndex(o => o.id === obj.id);
+          if (idx !== -1) objects.splice(idx, 1);
+        }, 80);
+      } catch (e) {}
+      updateUI();
+    }
+
+    return;
+  }
+
+  // Local non-authoritative flow
   obj.sliced = true;
-  // position for feedback: prefer hitPoint if provided
   const fx = (hitPoint && hitPoint.x) ? hitPoint.x : obj.x;
   const fy = (hitPoint && hitPoint.y) ? hitPoint.y : obj.y;
 
-  // bomb penalty
   if (obj.type === 'bomb') {
     score = Math.max(0, score - 20);
-    // bomb-specific particles and popup
     spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 18);
     spawnPopup(fx, fy, '-20', { col: 'rgba(255,80,80,0.95)', size: 20 });
     flashNotice('-20 (bomb)');
     playSound('bomb');
   } else {
     score += 10;
-    // fruit splash
     spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 12);
     spawnPopup(fx, fy, '+10', { col: 'rgba(255,240,200,1)', size: 18 });
     playSound('slice');
   }
-  // remove object after short delay to allow particles
+
   setTimeout(()=> {
     const idx = objects.findIndex(o => o.id === obj.id);
     if (idx !== -1) objects.splice(idx,1);
@@ -3292,7 +4103,35 @@ function flashNotice(text) {
 }
 
 function updateUI() {
-  scoreEl.textContent = `Score: ${score}`;
+  // Keep score display focused on local score only.
+  try {
+    scoreEl.textContent = `Score: ${score}`;
+  } catch (e) {
+    try { scoreEl.textContent = `Score: ${score}`; } catch(e){}
+  }
+
+  try {
+    // When in a room/server-authoritative flow, send periodic score updates to server (throttled).
+    if (serverAuthoritative && window.NET && typeof window.NET.sendScore === 'function') {
+      const now = Date.now();
+      if (!updateUI._lastSent || (now - updateUI._lastSent) > 800) {
+        try { window.NET.sendScore(score); } catch(e){ /* best-effort */ }
+        updateUI._lastSent = now;
+      }
+    }
+  } catch(e) { /* ignore UI send errors */ }
+
+  // Show Leave Game button when game is running (both single player and multiplayer)
+  try {
+    const leaveGameBtn = document.getElementById('leaveGameBtn');
+    if (leaveGameBtn) {
+      if (running) {
+        leaveGameBtn.style.display = 'inline-block';
+      } else {
+        leaveGameBtn.style.display = 'none';
+      }
+    }
+  } catch(e) { /* ignore */ }
 }
 
 // leaderboard persistence
@@ -3311,29 +4150,45 @@ function loadLeaders(gameId) {
 function saveLeader(name, score, gameId) {
   try {
     const gid = gameId || currentGameId;
+
+    // ensure a persistent local client id so we can reliably attribute scores across name changes
+    let clientId = null;
+    try {
+      clientId = localStorage.getItem('hand_ninja_client_id');
+      if (!clientId) {
+        clientId = 'c_' + Math.random().toString(36).slice(2,9);
+        localStorage.setItem('hand_ninja_client_id', clientId);
+      }
+    } catch (e) {
+      clientId = 'c_' + Math.random().toString(36).slice(2,9);
+    }
+
     // persist locally (compact + dedupe) so offline clients still have a view
     const list = loadLeaders(gid) || [];
-    list.push({ name, score, date: Date.now(), game: gid });
+    list.push({ name, score, date: Date.now(), game: gid, clientId });
+
+    // Dedupe primarily by clientId (if available), otherwise by normalized name.
     const bestByKey = {};
     for (const e of list) {
-      if (!e || !e.name) continue;
-      const rawName = String(e.name).trim() || 'Player';
-      const key = rawName.toLowerCase();
+      if (!e) continue;
+      const rawName = String(e.name || 'Player').trim() || 'Player';
+      const key = (e.clientId) ? `id:${e.clientId}` : `name:${rawName.toLowerCase()}`;
       const sc = Number(e.score) || 0;
       if (!bestByKey[key] || sc > bestByKey[key].score) {
-        bestByKey[key] = { name: rawName, score: sc, date: e.date || Date.now(), game: gid };
+        bestByKey[key] = { name: rawName, score: sc, date: e.date || Date.now(), game: gid, clientId: e.clientId || null };
       }
     }
+
     const compact = Object.values(bestByKey).sort((a,b) => b.score - a.score).slice(0,30);
     localStorage.setItem(storageKey(gid), JSON.stringify(compact));
-    console.info(`saveLeader -> key=${storageKey(gid)}, name=${name}, score=${score}, total=${compact.length}`);
+    console.info(`saveLeader -> key=${storageKey(gid)}, name=${name}, score=${score}, total=${compact.length}, clientId=${clientId}`);
 
     // Attempt to publish to server-side global leaderboard (non-blocking).
-    // NET.postScore will fallback to REST if socket not available.
+    // Include clientId so server can map identities reliably (when supported).
     try {
+      const payload = { game: gid, name, score, clientId };
       if (window.NET && typeof window.NET.postScore === 'function') {
-        window.NET.postScore({ game: gid, name, score }, (res) => {
-          // optional: log server response for debugging
+        window.NET.postScore(payload, (res) => {
           if (res && res.ok === false) console.warn('server leaderboard post failed', res);
         });
       } else {
@@ -3341,9 +4196,9 @@ function saveLeader(name, score, gameId) {
         fetch(`/leaderboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ game: gid, name, score })
+          body: JSON.stringify(payload)
         }).then(r => r.json()).then(j => {
-          // ignore response; server will emit leaderboard_update via socket if connected
+          // ignore response; server may emit leaderboard_update via socket if connected
         }).catch(()=>{ /* ignore */ });
       }
     } catch (e) {
@@ -3520,17 +4375,33 @@ function makeHands() {
     } catch (e) {}
   };
 
-  try {
+    try {
     const h = new Hands({
       locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
     });
+
+    // Force TRUE MIRROR MODE - Flip video at canvas level + coordinate fix
+    let selfieMode = false; // Don't use MediaPipe selfieMode
+    try {
+      console.log('👁️ USING TRUE MIRROR MODE: Video flipped at canvas level');
+      console.log('✋ Hand coordinates will be adjusted for natural mirror movement');
+    } catch (e) {
+      console.warn('Mirror mode setup error:', e);
+    }
+
     h.setOptions({
-      selfieMode: true,
+      selfieMode: !!selfieMode,
       maxNumHands: 2,
       modelComplexity: 0,
       minDetectionConfidence: 0.6,
       minTrackingConfidence: 0.5
     });
+
+    // record the MediaPipe "selfieMode" choice so receivers can know whether the sender used a mirrored camera.
+    try { 
+      if (!window.__handNinja) window.__handNinja = {};
+      window.__handNinja.handsSelfieMode = !!selfieMode;
+    } catch(e){}
     h.onResults(onResults);
 
     // schedule restore after grace period unless persistent suppression requested
@@ -3590,16 +4461,36 @@ async function startCamera() {
       const hasVideoFrame = (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0);
       if (hasVideoFrame) {
         try {
+          try { console.debug && console.debug('hands before send', hands && (typeof hands === 'object' ? Object.keys(hands) : typeof hands)); } catch(e){}
           await hands.send({ image: videoEl });
           cameraController.errCount = 0;
         } catch (e) {
           cameraController.errCount = (cameraController.errCount || 0) + 1;
-          console.warn('hands.send error', e);
-          // Recreate the Hands instance earlier if the internal WASM/GL handle becomes invalid.
-          // Use a small threshold to recover quickly from transient aborts without spamming recreation.
-          if (cameraController.errCount >= 2) {
-            try { if (hands && hands.close) { try { hands.close(); } catch(err){} } } catch(err){}
-            try { hands = makeHands(); } catch(err) { console.warn('makeHands failed during recreate', err); }
+          try { console.warn('hands.send error', e && (e.stack || e)); } catch(ex){}
+          // aggressive recovery: attempt to recreate Hands sooner with a small backoff to avoid thrash.
+          const nowTs = Date.now();
+          cameraController._lastErrTs = cameraController._lastErrTs || 0;
+          cameraController._lastRecreateTs = cameraController._lastRecreateTs || 0;
+          const sinceLastRecreate = nowTs - (cameraController._lastRecreateTs || 0);
+          const shouldRecreate = (cameraController.errCount >= 1 && sinceLastRecreate > 3000) || (cameraController.errCount >= 3);
+          if (shouldRecreate) {
+            try {
+              if (hands && typeof hands.close === 'function') {
+                // try async close if available
+                if (hands.close.constructor && hands.close.constructor.name === 'AsyncFunction') {
+                  try { await hands.close(); } catch(errClose){ console.warn('hands.close async failed', errClose); }
+                } else {
+                  try { hands.close(); } catch(errClose){ console.warn('hands.close failed', errClose); }
+                }
+              }
+            } catch(errClose) { console.warn('hands.close threw', errClose); }
+            try {
+              hands = makeHands();
+              cameraController._lastRecreateTs = Date.now();
+              console.info('Recreated Hands instance after send error');
+            } catch(errMake) {
+              console.warn('makeHands failed during recreate', errMake && (errMake.stack || errMake));
+            }
             cameraController.errCount = 0;
           }
         }
@@ -3737,10 +4628,12 @@ async function warmCameraWithMediaPipe(timeoutMs = 8000) {
     const MAX_HAND_DETECTION_ATTEMPTS = 30; // 30 frames = ~1 second at 30fps
     
     // Create a temporary onResults handler to detect hands
-    const originalOnResults = hands ? hands.onResults : null;
+    // NOTE: Hands exposes onResults(fn) to register a callback; it does not provide a getter.
+    // Use the module-level `onResults` handler as the original callback to avoid calling the setter as if it were the handler.
+    const originalOnResults = (typeof onResults === 'function') ? onResults : null;
     const testHandDetection = (results) => {
-      // Call original handler to keep video flowing
-      if (originalOnResults) originalOnResults(results);
+      // Call original handler to keep video flowing (best-effort)
+      try { if (typeof originalOnResults === 'function') originalOnResults(results); } catch(e){ /* ignore */ }
       
       handDetectionAttempts++;
       
@@ -3751,9 +4644,7 @@ async function warmCameraWithMediaPipe(timeoutMs = 8000) {
           clearTimeout(handDetectionTimeout);
           
           // Restore normal onResults and enable controls
-          if (hands && originalOnResults) {
-            hands.onResults(originalOnResults);
-          }
+          try { if (hands && typeof originalOnResults === 'function') hands.onResults(originalOnResults); } catch(e){ /* ignore */ }
           
           setMenuControlsEnabled(true);
           try { noticeEl.textContent = 'Ready! Hand tracking is working. Select a game and press Play.'; } catch(e){}
@@ -3764,19 +4655,15 @@ async function warmCameraWithMediaPipe(timeoutMs = 8000) {
         clearTimeout(handDetectionTimeout);
         
         // Restore normal onResults and enable controls
-        if (hands && originalOnResults) {
-          hands.onResults(originalOnResults);
-        }
+        try { if (hands && typeof originalOnResults === 'function') hands.onResults(originalOnResults); } catch(e){ /* ignore */ }
         
         setMenuControlsEnabled(true);
         try { noticeEl.textContent = 'Ready! (Move your hands in front of camera to test hand tracking)'; } catch(e){}
       }
     };
 
-    // Set the test handler
-    if (hands) {
-      hands.onResults(testHandDetection);
-    }
+    // Set the test handler (register temporary detector)
+    try { if (hands) hands.onResults(testHandDetection); } catch(e){}
 
     // Set timeout to enable controls even if no hands detected (longer fallback)
     handDetectionTimeout = setTimeout(() => {
@@ -3839,6 +4726,11 @@ function stopMenuPreviewLoop() {
  // game loop via MediaPipe onResults
 function drawPeerGhosts() {
   try {
+    // Skip peer rendering when inside a room using the simplified admin-driven model.
+    // This disables peer ghosts/paints to ensure all users see only the admin-controlled game.
+    const roomsStateLocal = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+    if (roomsStateLocal && roomsStateLocal.room) return;
+
     // ensure canvas transform and state are consistent for peer overlays
     // (some callers may change ctx transform/state; restore a known baseline)
     try { ctx.save(); ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.globalCompositeOperation = 'source-over'; } catch(e) {}
@@ -4074,13 +4966,13 @@ function drawPeerGhosts() {
         // - paint_only: do not draw hands (paints drawn elsewhere), draw name near last paint if available
         // - ball_only: draw a small avatar/ball at primary tip (no name)
         // - ball_name: draw the ball and the name
-        // - avatar_ball: draw the game avatar/ball instead of finger/hand
+        // - avatar_ball: show the game-controlled avatar/ball instead of fingertip
         const visibilityMap = {
           'ninja-fruit': 'hands_name',
           'shape-trace': 'hands_name',
-          'paint-air': 'paint_only',
-          'maze-mini': 'avatar_ball',
-          'runner-control': 'avatar_ball',
+          'paint-air': 'avatar_ball', // Show game-controlled avatar ball for paint-air
+          'maze-mini': 'avatar_ball', // Show maze avatar ball instead of finger hand
+          'runner-control': 'avatar_ball', // Show runner avatar ball instead of finger pointer
           'follow-dot': 'ball_name'
         };
         const mode = visibilityMap[currentGameId] || 'hands_name';
@@ -4160,26 +5052,8 @@ function drawPeerGhosts() {
 
         // For ball modes, draw a small circular avatar at the primary tip.
         // If no primary tip is available, fall through to draw the full skeleton so peers remain visible.
-        if (mode === 'ball_only' || mode === 'ball_name' || mode === 'avatar_ball') {
-          let pt = getPrimaryPoint(st.displayHands);
-
-          // For avatar_ball mode, try to get the game avatar position instead of finger
-          if (mode === 'avatar_ball') {
-            if (currentGameId === 'maze-mini' && window.__handNinja && window.__handNinja._mazePlayer) {
-              // Use maze player position
-              const mazePlayer = window.__handNinja._mazePlayer;
-              if (mazePlayer && typeof mazePlayer.x === 'number' && typeof mazePlayer.y === 'number') {
-                pt = { x: mazePlayer.x, y: mazePlayer.y };
-              }
-            } else if (currentGameId === 'runner-control' && window.__handNinja && window.__handNinja._runnerAvatar) {
-              // Use runner avatar position
-              const runnerAvatar = window.__handNinja._runnerAvatar;
-              if (runnerAvatar && typeof runnerAvatar.x === 'number' && typeof runnerAvatar.y === 'number') {
-                pt = { x: runnerAvatar.x, y: runnerAvatar.y };
-              }
-            }
-          }
-
+        if (mode === 'ball_only' || mode === 'ball_name') {
+          const pt = getPrimaryPoint(st.displayHands);
           if (pt && typeof pt.x === 'number') {
             ctx.save();
             ctx.globalAlpha = fadeFactor;
@@ -4377,50 +5251,62 @@ function onResults(results) {
   // draw video
   drawVideoFrame(results.image);
 
-  // Handle object spawning and physics for multiplayer games
-  if (isMultiplayerGame && serverGameState && serverGameState.objects) {
-    // In multiplayer mode, use server-provided objects
-    // Update existing objects from server state
-    for (const serverObj of serverGameState.objects) {
-      const localObj = objects.find(o => o.id === serverObj.id);
-      if (!localObj && !serverObj.sliced) {
-        // Add new server object to local rendering
-        objects.push({
-          ...serverObj,
-          sliced: false
-        });
-      } else if (localObj && serverObj.sliced && !localObj.sliced) {
-        // Mark local object as sliced if server says it is
-        localObj.sliced = true;
-      }
-    }
+  // update spawn timers + objects only for ninja-fruit mode
+  if (currentGameId === 'ninja-fruit') {
+  // Spawn handling for ninja-fruit:
+  // - In server-authoritative mode, process scheduled items provided by server to avoid duplicate local spawns.
+  // - Otherwise fall back to local deterministic spawning.
+  if (serverAuthoritative && running) {
+    // Process server-supplied scheduled items (throttled inside function).
+    try {
+      // Only treat scheduledGameItems as "present" when there are still unspawned entries.
+      // Previously a non-empty array with all items marked _spawned prevented the client fallback
+      // from running; that caused spawns to stop once the server-provided list was exhausted.
+      if (Array.isArray(scheduledGameItems) && scheduledGameItems.some(it => !it._spawned)) {
+        processScheduledSpawns(Date.now());
+      } else {
+        // No pending scheduled items provided by server — fallback to local spawning so the game remains playable.
+        // Use local spawn caps when falling back so players still see multiple fruits/bombs.
+        const fruitInterval = FRUIT_SPAWN_INTERVAL;
+        const bombInterval = BOMB_SPAWN_INTERVAL;
 
-    // Remove objects that are no longer in server state
-    objects = objects.filter(obj => {
-      const serverObj = serverGameState.objects.find(s => s.id === obj.id);
-      return serverObj && !serverObj.sliced;
-    });
-  } else if (currentGameId === 'ninja-fruit') {
-    // Single-player mode: spawn objects locally
-    if (running) {
-      if (now - lastFruitSpawn > FRUIT_SPAWN_INTERVAL) {
-        lastFruitSpawn = now;
-        spawnFruit();
+        if (now - lastFruitSpawn > fruitInterval) {
+          lastFruitSpawn = now;
+          // forceLocal tells spawnFruit to ignore the server-authoritative caps so the client
+          // can continue showing a playable amount of objects when the server didn't provide items.
+          spawnFruit({ forceLocal: true });
+        }
+        if (now - lastBombSpawn > bombInterval) {
+          lastBombSpawn = now;
+          if (Math.random() < 0.6) spawnBomb({ forceLocal: true });
+        }
       }
-      if (now - lastBombSpawn > BOMB_SPAWN_INTERVAL) {
-        lastBombSpawn = now;
-        // low probability additional check to keep bombs rare
-        if (Math.random() < 0.6) spawnBomb();
-      }
+    } catch(e) { console.warn('processScheduledSpawns failed', e); }
+  } else if (running) {
+    // Local deterministic spawning for solo play.
+    // Keep intervals configurable; use base constants here.
+    const fruitInterval = FRUIT_SPAWN_INTERVAL;
+    const bombInterval = BOMB_SPAWN_INTERVAL;
+
+    if (now - lastFruitSpawn > fruitInterval) {
+      lastFruitSpawn = now;
+      spawnFruit();
+      console.log('Spawned fruit locally:', objects.length);
     }
+    if (now - lastBombSpawn > bombInterval) {
+      lastBombSpawn = now;
+      if (Math.random() < 0.6) spawnBomb();
+      console.log('Spawned bomb locally:', objects.length);
+    }
+  }
+  // update objects physics & draw for all ninja-fruit modes
+  drawObjects(dt);
+  if (objects.length > 0) {
+    console.log(`Rendering ${objects.length} objects in ninja-fruit mode`);
+  }
   } else {
     // Non-fruit modes should not show ninja objects; clear any leftover objects.
     if (objects.length) objects.length = 0;
-  }
-
-  // Always update and draw objects if they exist
-  if (objects.length > 0) {
-    drawObjects(dt);
   }
 
   // map landmarks and draw hand trails and collision detection
@@ -4454,14 +5340,23 @@ function onResults(results) {
         lm: (quantizedHands.length === 1 ? quantizedHands[0] : quantizedHands),
         cw: canvas.width / DPR,
         ch: canvas.height / DPR,
+        // propagate local MediaPipe selfie/mirror hint so peers can choose correct flip heuristics
+        selfie: !!(window.__handNinja && window.__handNinja.handsSelfieMode),
         name: (playerNameEl && playerNameEl.value) ? String(playerNameEl.value).slice(0,24) : 'Player'
       };
       
       try {
-        if (typeof window.NET.sendHand === 'function') {
-          window.NET.sendHand(payload);
-        } else if (window.NET.socket && typeof window.NET.socket.emit === 'function') {
-          window.NET.socket.emit('hand', payload);
+        // In simplified room model, avoid sending per-frame hand telemetry.
+        // If not in a room or the client is the admin, allow sending as before.
+        const roomsStateLocal = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+        const inRoom = roomsStateLocal && roomsStateLocal.room;
+        const isAdmin = roomsStateLocal && roomsStateLocal.isAdmin;
+        if (!inRoom || isAdmin) {
+          if (typeof window.NET.sendHand === 'function') {
+            window.NET.sendHand(payload);
+          } else if (window.NET.socket && typeof window.NET.socket.emit === 'function') {
+            window.NET.socket.emit('hand', payload);
+          }
         }
       } catch (e) {
         // best-effort; ignore send failures
@@ -4512,7 +5407,7 @@ drawPeerGhosts();
     try {
       mazeModule.update(dt, mappedHands);
     } catch (e) { console.warn('maze update failed', e); }
-  } else if (currentGameId === 'paint-air') {
+    } else if (currentGameId === 'paint-air') {
     try {
       const nowT = performance.now();
       const handCount = mappedHands.length;
@@ -4597,18 +5492,25 @@ drawPeerGhosts();
           lastPaintPushT = nowT;
 
           // Send paint point to server for peer forwarding (best-effort)
-          try {
-            if (window.NET && typeof window.NET.sendPaint === 'function') {
-              const cw = canvas.width / DPR;
-              const ch = canvas.height / DPR;
-              const payload = {
-                pts: [{ x: pt.x, y: pt.y, t: pt.t, color: pt.color, size: pt.size }],
-                cw, ch,
-                name: (playerNameEl && playerNameEl.value) ? String(playerNameEl.value).slice(0,24) : 'Player'
-              };
-              try { window.NET.sendPaint(payload); } catch(e){}
-            }
-          } catch(e) {}
+              try {
+                // Do not forward per-point paint to server when participating inside a room
+                // in the simplified admin-driven model. Admins may still send paints.
+                const roomsStateLocal = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+                const inRoom = roomsStateLocal && roomsStateLocal.room;
+                const isAdmin = roomsStateLocal && roomsStateLocal.isAdmin;
+                if (!inRoom || isAdmin) {
+                  if (window.NET && typeof window.NET.sendPaint === 'function') {
+                    const cw = canvas.width / DPR;
+                    const ch = canvas.height / DPR;
+                    const payload = {
+                      pts: [{ x: pt.x, y: pt.y, t: pt.t, color: pt.color, size: pt.size }],
+                      cw, ch,
+                      name: (playerNameEl && playerNameEl.value) ? String(playerNameEl.value).slice(0,24) : 'Player'
+                    };
+                    try { window.NET.sendPaint(payload); } catch(e){}
+                  }
+                }
+              } catch(e) {}
           
           // Play paint stroke sound for responsive feedback
         try {
@@ -4648,7 +5550,7 @@ drawPeerGhosts();
               // simple age-based cleanup
               const last = pArr[pArr.length - 1];
               const ageMs = Date.now() - (last && last.t ? last.t : Date.now());
-              if (ageMs > 5000) { delete peerPaints[pid]; continue; }
+              if (ageMs > 12000) { delete peerPaints[pid]; continue; }
 
               // Draw strokes robustly: handle single-point dots, multi-point continuous stroke,
               // skip null/holes, and add end-caps to avoid single-pixel gaps.
@@ -4716,64 +5618,110 @@ drawPeerGhosts();
             }
           } catch(e) { console.warn('peer paint render failed', e); }
 
+          // Overlay a subtle coordinate indicator to show mirror mode status
+          try {
+            ctx.save();
+            ctx.globalAlpha = 0.6;
+            ctx.font = '12px sans-serif';
+            ctx.fillStyle = 'yellow';
+            ctx.textAlign = 'left';
+            const selfieMode = !!(window.__handNinja && window.__handNinja.handsSelfieMode);
+            const statusText = selfieMode ? 'MIRROR: ON' : 'MIRROR: OFF';
+            ctx.fillText(statusText, 10, canvas.height / DPR - 10);
+            ctx.restore();
+          } catch(e) { /* ignore mirror status indicator */ }
+
           // Rendering: iterate paintPaths, respect separators (null) and per-point color/size.
           // Skip points that fall inside any erase mask.
           // Draw strokes by honoring separators and point-level styles (skip deleted points)
           if (paintPaths.length) {
-        let started = false;
+        let strokeStart = -1;
         let lastColor = null, lastSize = null;
-        for (let i = 0; i < paintPaths.length; i++) {
+
+        for (let i = 0; i <= paintPaths.length; i++) {
           const p = paintPaths[i];
-          if (p === null) {
-            // separator: end any current stroke
-            started = false;
-            continue;
+
+          // Handle stroke completion or end of array
+          if (p === null || i === paintPaths.length || (p && p._deleted)) {
+            if (strokeStart !== -1) {
+              // We have a complete stroke to render
+              try {
+                ctx.beginPath();
+                ctx.lineJoin = 'round';
+                ctx.lineCap = 'round';
+                ctx.strokeStyle = lastColor || paintColor;
+                ctx.lineWidth = lastSize || paintSize;
+
+                let moved = false;
+                for (let j = strokeStart; j < i; j++) {
+                  const pt = paintPaths[j];
+                  if (pt && !pt._deleted) {
+                    if (!moved) {
+                      ctx.moveTo(pt.x, pt.y);
+                      moved = true;
+                    } else {
+                      ctx.lineTo(pt.x, pt.y);
+                    }
+                  }
+                }
+
+                if (moved) {
+                  ctx.stroke();
+                }
+              } catch (e) {
+                console.warn('Stroke render error:', e);
+              }
+            }
+            strokeStart = -1; // Reset stroke
+            lastColor = null;
+            lastSize = null;
           }
-          if (p && p._deleted) continue; // skip erased points
-          // if we need to begin a new sub-path or style changed
-          const color = p.color || paintColor;
-          const size = p.size || paintSize;
-          if (!started || color !== lastColor || size !== lastSize) {
-            ctx.beginPath();
-            ctx.lineJoin = 'round';
-            ctx.lineCap = 'round';
-            ctx.strokeStyle = color;
-            ctx.lineWidth = size;
-            // find previous non-deleted point in this subpath to moveTo
-            let moved = false;
-            for (let j = i - 1; j >= 0; j--) {
-              const q = paintPaths[j];
-              if (q === null) break;
-              if (q && !q._deleted) { ctx.moveTo(q.x, q.y); moved = true; break; }
-            }
-            if (!moved) ctx.moveTo(p.x, p.y);
-            ctx.lineTo(p.x, p.y);
-            ctx.stroke();
-            started = true;
-            lastColor = color;
-            lastSize = size;
-          } else {
-            // continue same stroke style; draw segment
-            ctx.beginPath();
-            ctx.lineJoin = 'round';
-            ctx.lineCap = 'round';
-            ctx.strokeStyle = lastColor;
-            ctx.lineWidth = lastSize;
-            // find previous drawable non-deleted point
-            let prevPoint = null;
-            for (let j = i - 1; j >= 0; j--) {
-              const q = paintPaths[j];
-              if (q === null) break;
-              if (q && !q._deleted) { prevPoint = q; break; }
-            }
-            if (prevPoint) {
-              ctx.moveTo(prevPoint.x, prevPoint.y);
-              ctx.lineTo(p.x, p.y);
-              ctx.stroke();
+
+          // Handle point addition to current stroke
+          if (p && !p._deleted) {
+            if (strokeStart === -1) {
+              // Starting new stroke
+              strokeStart = i;
+              lastColor = p.color || paintColor;
+              lastSize = p.size || paintSize;
             } else {
-              ctx.moveTo(p.x, p.y);
-              ctx.lineTo(p.x, p.y);
-              ctx.stroke();
+              // Continuing stroke - ensure color/size consistency
+              const color = p.color || paintColor;
+              const size = p.size || paintSize;
+              if (color !== lastColor || size !== lastSize) {
+                // Style change - finish current stroke and start new one
+                if (strokeStart !== -1) {
+                  try {
+                    ctx.beginPath();
+                    ctx.lineJoin = 'round';
+                    ctx.lineCap = 'round';
+                    ctx.strokeStyle = lastColor;
+                    ctx.lineWidth = lastSize;
+
+                    let moved = false;
+                    for (let j = strokeStart; j < i; j++) {
+                      const pt = paintPaths[j];
+                      if (pt && !pt._deleted) {
+                        if (!moved) {
+                          ctx.moveTo(pt.x, pt.y);
+                          moved = true;
+                        } else {
+                          ctx.lineTo(pt.x, pt.y);
+                        }
+                      }
+                    }
+
+                    if (moved) {
+                      ctx.stroke();
+                    }
+                  } catch (e) {
+                    console.warn('Style change stroke render error:', e);
+                  }
+                }
+                strokeStart = i; // Start new stroke from current point
+                lastColor = color;
+                lastSize = size;
+              }
             }
           }
         }
@@ -5169,19 +6117,6 @@ drawPeerGhosts();
           const obj = objects[i];
           if (obj.sliced) continue;
           if (sliceSegmentIntersectsFruit(p.x,p.y,q.x,q.y,obj)) {
-            // Send object hit to server for synchronization
-            if (isMultiplayerGame && window.NET && typeof window.NET.sendObjectHit === 'function') {
-              try {
-                window.NET.sendObjectHit({
-                  objectId: obj.id,
-                  hitType: obj.type === 'bomb' ? 'bomb' : 'slice',
-                  points: obj.type === 'bomb' ? -20 : 10
-                });
-              } catch (e) {
-                console.warn('Failed to send object hit to server:', e);
-              }
-            }
-
             handleHit(obj, { x: (p.x+q.x)/2, y: (p.y+q.y)/2 });
           }
         }
@@ -5202,6 +6137,16 @@ drawPeerGhosts();
     } else {
       const elapsed = (now - startTime) / 1000;
       const remaining = Math.max(0, duration - Math.floor(elapsed));
+
+      // Append room high-score (name + score) next to the timer when available.
+      let highText = '';
+      try {
+        if (roomHighScore && typeof roomHighScore.score === 'number') {
+          const hn = roomHighScore.name ? String(roomHighScore.name).slice(0,12) : 'Room';
+          highText = ` · Room High: ${hn} ${roomHighScore.score}`;
+        }
+      } catch (e) { highText = ''; }
+
       timerEl.textContent = `Time: ${remaining}s`;
       if (remaining <= 0) endGame();
     }
@@ -5453,6 +6398,8 @@ async function startGame() {
   // Only mark running after camera & hands are active
   running = true;
   menuEl.style.display = 'none';
+  // Immediately refresh HUD so the Leave button and other runtime UI appear as soon as the run is marked running.
+  try { updateUI(); } catch(e){}
   
   // Clear canvas to prevent black screen issues
   try {
@@ -5492,7 +6439,20 @@ async function endGame() {
   console.log(`Ending game: ${currentGameId}, final score: ${score}`);
   
   running = false;
-  
+  // Ensure UI hides the Leave button and updates HUD immediately when the run ends.
+  try { updateUI(); } catch(e){}
+
+  // Ensure music is stopped when a run completes. Use centralized controller if available,
+  // and as a fallback perform a full audio teardown to avoid lingering BGM.
+  try {
+    const mc = window.__handNinja && window.__handNinja.musicController;
+    if (mc && typeof mc.stop === 'function') {
+      try { mc.stop({ force: true }); } catch(e){ console.warn('musicController.stop in endGame failed', e); }
+    }
+  } catch (e) { console.warn('endGame music stop guard failed', e); }
+
+  try { stopAllAudio(); } catch(e){ console.warn('stopAllAudio in endGame failed', e); }
+
   // Clean up mode-specific state
   try {
     if (currentGameId === 'runner-control') {
@@ -5516,11 +6476,29 @@ async function endGame() {
   
   // keep camera running (do not stop media tracks) to avoid re-prompting for permission on restart
   // save leaderboard
-  const name = (playerNameEl.value || 'Player').slice(0,24);
+  const name = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder).slice(0,24) : 'Player';
   // save under the currently selected game id to ensure per-game isolation
   const sel = document.getElementById('gameSelect');
   const gid = (sel && sel.value) ? sel.value : currentGameId;
   saveLeader(name, score, gid);
+
+  // Reset any cached room high score for this game to a zeroed entry using the local player's name.
+  // Preserve a defined entry so other UI flows keep a consistent "Room Best: <name>: 0" view.
+    try {
+      const clientId = (function() { try { return localStorage.getItem('hand_ninja_client_id'); } catch(e) { return null; } })();
+      const localName = (playerNameEl && (playerNameEl.value || playerNameEl.placeholder)) ? (playerNameEl.value || playerNameEl.placeholder).slice(0,24) : 'Player';
+      roomHighScoresByGame[gid] = { name: String(localName), score: 0, game: gid, clientId: clientId || null };
+      try { roomHighScoreResetTimestamps[gid] = Date.now(); } catch(e) {}
+      roomHighScore = roomHighScoresByGame[gid];
+      if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay();
+
+    const roomHighScoreEl = document.getElementById('roomHighScore');
+    if (roomHighScoreEl) {
+      roomHighScoreEl.textContent = `Room Best: ${String(roomHighScore.name || 'Player').slice(0,12)}: ${Number(roomHighScore.score || 0)}`;
+      roomHighScoreEl.setAttribute('data-visible', 'true');
+      roomHighScoreEl.style.display = 'inline-block';
+    }
+  } catch (e) { console.warn('Failed to reset room high score on endGame', e); }
   
   console.log(`Saved score ${score} for ${name} in game ${gid}`);
   
@@ -5578,6 +6556,28 @@ showLeadersBtn.addEventListener('click', ()=> showLeaders());
 closeLeadersBtn.addEventListener('click', ()=> leaderboardEl.style.display = 'none');
 clearLeadersBtn.addEventListener('click', ()=> clearLeaders());
 
+const leaveGameBtn = document.getElementById('leaveGameBtn');
+if (leaveGameBtn) {
+  // Position the Leave button so it won't overlap the room best-score box and appears consistently.
+  try {
+    leaveGameBtn.style.position = 'fixed';
+    leaveGameBtn.style.top = '12px';
+    leaveGameBtn.style.right = '12px';
+    leaveGameBtn.style.zIndex = '99995';
+    // Start hidden; updateUI() toggles visibility based on running state.
+    leaveGameBtn.style.display = 'none';
+    // Use a lightweight transform to create a new stacking context on some browsers to avoid overlap glitches.
+    leaveGameBtn.style.transform = 'translateZ(0)';
+  } catch(e){}
+
+  // Leave button click handler — posts score and exits the room when clicked.
+  leaveGameBtn.addEventListener('click', () => {
+    try {
+      cleanupAfterLeave();
+    } catch(e) { console.warn('cleanupAfterLeave failed from leave button', e); }
+  });
+}
+
 /* Export removed — leaderboard now strictly per-game to keep UI minimal. */
 
 /* music controls: synchronize both menu and game music checkboxes */
@@ -5616,6 +6616,8 @@ if (gameSel) {
     currentGameId = e.target.value || 'default';
     // update leaderboard title if open
     if (leaderboardEl && leaderboardEl.style.display === 'flex') showLeaders();
+    // Keep room high-score display in sync with the currently selected game.
+    try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
   });
 }
 
@@ -5965,6 +6967,114 @@ if (gameSel) {
 }
 
 playerNameEl.placeholder = 'Player';
+if (playerNameEl) {
+  try {
+    // Keep local name unique while user types and after blur (defensive).
+    // Also keep the room high-score display in sync with the live local name when appropriate.
+    playerNameEl.addEventListener('input', () => { 
+      try { 
+        ensureLocalNameUnique(); 
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+        // Ensure cached room highscore updates when our local name changes.
+        try {
+          const gid = currentGameId || 'default';
+          const rh = roomHighScoresByGame[gid];
+          const localCid = (function(){ try { return localStorage.getItem('hand_ninja_client_id'); } catch(e){ return null; } })();
+          const localName = (playerNameEl.value || playerNameEl.placeholder) ? String(playerNameEl.value || playerNameEl.placeholder) : '';
+
+          // Update when we can reliably attribute the cached entry to ourselves
+          if (rh && rh.clientId && localCid && rh.clientId === localCid) {
+            rh.name = localName;
+            roomHighScoresByGame[gid] = rh;
+            try { roomHighScoreEditedTimestamps[gid] = Date.now(); } catch(e){}
+          } else if (rh && typeof rh.score === 'number' && typeof score === 'number' && Number(rh.score) === Number(score)) {
+            // If our local score equals the cached room high score, prefer our live name.
+            rh.name = localName;
+            roomHighScoresByGame[gid] = rh;
+            try { roomHighScoreEditedTimestamps[gid] = Date.now(); } catch(e){}
+          } else if (rh && rh.name && String(rh.name || '').trim().toLowerCase() === String(prevLocalName || '').trim().toLowerCase()) {
+            // If the cached name matches our previous name, treat the edit as a rename of the same identity.
+            try {
+              rh.name = localName;
+              roomHighScoresByGame[gid] = rh;
+              roomHighScoreEditedTimestamps[gid] = Date.now();
+            } catch(e){}
+          }
+
+          // Propagate name-change to server if supported so authoritative records can be updated.
+          try {
+            if (window.NET) {
+              if (typeof window.NET.sendNameChange === 'function') {
+                window.NET.sendNameChange({ name: localName });
+              } else if (NET && NET.socket && typeof NET.socket.emit === 'function') {
+                NET.socket.emit('name_change', { name: localName });
+              } else if (typeof NET.send === 'function') {
+                NET.send('name_change', { name: localName });
+              }
+            }
+          } catch(e){ /* non-fatal */ }
+
+          prevLocalName = localName;
+        } catch(e){}
+      } catch(e){} 
+    });
+    playerNameEl.addEventListener('input', () => { 
+      try { 
+        ensureLocalNameUnique(); 
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+        // Ensure cached room highscore updates when our local name changes.
+        try {
+          const gid = currentGameId || 'default';
+          const rh = roomHighScoresByGame[gid];
+          const localCid = (function(){ try { return localStorage.getItem('hand_ninja_client_id'); } catch(e){ return null; } })();
+          const localName = (playerNameEl.value || playerNameEl.placeholder) ? String(playerNameEl.value || playerNameEl.placeholder) : '';
+
+          // Update when we can reliably attribute the cached entry to ourselves
+          if (rh && rh.clientId && localCid && rh.clientId === localCid) {
+            rh.name = localName;
+            roomHighScoresByGame[gid] = rh;
+            try { roomHighScoreEditedTimestamps[gid] = Date.now(); } catch(e){}
+          } else if (rh && typeof rh.score === 'number' && typeof score === 'number' && Number(rh.score) === Number(score)) {
+            // If our local score equals the cached room high score, prefer our live name.
+            rh.name = localName;
+            roomHighScoresByGame[gid] = rh;
+            try { roomHighScoreEditedTimestamps[gid] = Date.now(); } catch(e){}
+          } else if (rh && rh.name && String(rh.name || '').trim().toLowerCase() === String(prevLocalName || '').trim().toLowerCase()) {
+            // If the cached name matches our previous name, treat the edit as a rename of the same identity.
+            try {
+              rh.name = localName;
+              roomHighScoresByGame[gid] = rh;
+              roomHighScoreEditedTimestamps[gid] = Date.now();
+            } catch(e){}
+          }
+
+          // Propagate name-change to server if supported so authoritative records can be updated.
+          try {
+            if (window.NET) {
+              if (typeof window.NET.sendNameChange === 'function') {
+                window.NET.sendNameChange({ name: localName });
+              } else if (NET && NET.socket && typeof NET.socket.emit === 'function') {
+                NET.socket.emit('name_change', { name: localName });
+              } else if (typeof NET.send === 'function') {
+                NET.send('name_change', { name: localName });
+              }
+            }
+          } catch(e){ /* non-fatal */ }
+
+          prevLocalName = localName;
+        } catch(e){}
+      } catch(e){} 
+    });
+    playerNameEl.addEventListener('blur',  () => { 
+      try { 
+        ensureLocalNameUnique(); 
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+      } catch(e){} 
+    });
+    // Ensure initial placeholder / value is unique with current peers and refresh highscore UI.
+    try { ensureLocalNameUnique(); if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+  } catch(e) {}
+}
 
 /* automatic resume if user navigates back (defensive)
    Avoid calling stopCamera() here because stopping media tracks can
@@ -6010,13 +7120,17 @@ if (window.NET) {
             if (sel) sel.value = data.game;
             // Make the server's game selection authoritative locally so subsequent logic uses it
             try { currentGameId = data.game; } catch (e) { /* ignore if not writable */ }
-            // Best-effort: update background music asset to match admin-selected game (do not force playback here)
-            try { if (typeof updateGameBGM === 'function') updateGameBGM(data.game, { force: false }); } catch (e) { console.warn('updateGameBGM failed on game_start', e); }
           }
           if (data && typeof data.timeLimit === 'number') {
             const gl = document.getElementById('gameLength');
             if (gl) gl.value = data.timeLimit;
           }
+
+          // Accept server-provided scheduled items (if present). Items are expected to have
+          // a spawnTime offset (ms) relative to the authoritative game start time.
+          try {
+            scheduledGameItems = Array.isArray(data && data.items) ? (data.items.slice()) : scheduledGameItems;
+          } catch (e) { scheduledGameItems = scheduledGameItems || []; }
 
         // Show "waiting" overlay while we preload and warm camera/audio
         showWaitingForPlayersOverlay(true, 'Preparing your client — loading assets and hand tracking');
@@ -6065,7 +7179,19 @@ if (window.NET) {
         }
         window.__handNinja._gameStartFallbackTimeout = setTimeout(() => {
           try {
+            // If we're inside a server room and not the admin, do NOT start a local fallback.
+            // Wait for the room admin / server to send the authoritative `game_begin`.
+            const roomsStateInner = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+            const inRoom = roomsStateInner && roomsStateInner.room;
+            const isAdmin = roomsStateInner && roomsStateInner.isAdmin;
             if (!window.__handNinja._gameBegun) {
+              if (inRoom && !isAdmin) {
+                console.warn('No game_begin received; waiting for room admin to start authoritative game.');
+                // keep the waiting overlay visible and do not start local game
+                showWaitingForPlayersOverlay(true, 'Waiting for room admin to start the game…');
+                return;
+              }
+              // Not in a room or we are the admin — safe to fall back to a local start
               console.warn('Fallback: server did not send game_begin in time; starting local game');
               showWaitingForPlayersOverlay(false);
               // seed RNG from current time for local randomness
@@ -6078,30 +7204,81 @@ if (window.NET) {
     });
 
     NET.on('game_end', (data) => {
-      try { endGame(); } catch (e) { console.warn('game_end handler failed', e); }
+      try {
+        endGame();
+      } catch (e) { console.warn('game_end handler failed', e); }
     });
 
     // Server authoritative begin: server sends a startTime (epoch ms) and optional seed for deterministic spawns.
     NET.on('game_begin', (data) => {
       try {
         console.log('Received server game_begin:', data);
-
+        
         // mark begun and clear fallback timer
         try { if (window.__handNinja) window.__handNinja._gameBegun = true; } catch(e){}
         try { if (window.__handNinja && window.__handNinja._gameStartFallbackTimeout) { clearTimeout(window.__handNinja._gameStartFallbackTimeout); window.__handNinja._gameStartFallbackTimeout = null; } } catch(e){}
 
-        // Extract startTime, seed, and gameState
+        // Extract startTime and seed
         const startEpoch = (data && data.startTime) ? Number(data.startTime) : Date.now();
         const seed = (typeof data.seed === 'number') ? Number(data.seed) : (data && data.seed ? Number(String(data.seed).split('').reduce((s,c)=>s + c.charCodeAt(0),0)) : Date.now());
-        const serverGameState = data && data.gameState ? data.gameState : null;
 
-        console.log(`Server game_begin - startEpoch: ${startEpoch}, seed: ${seed}, currentGame: ${currentGameId}, hasGameState: ${!!serverGameState}`);
+        console.log(`Server game_begin - startEpoch: ${startEpoch}, seed: ${seed}, currentGame: ${currentGameId}`);
 
-        // Store server game state and mark as multiplayer
-        if (serverGameState) {
-          serverGameState = serverGameState;
-          isMultiplayerGame = true;
-          localPlayerId = NET.socket && NET.socket.id ? NET.socket.id : null;
+          // record authoritative epoch and prepare scheduled items (either server-sent or generated from seed)
+        try {
+          // mark server-authoritative early so local fallback generators and spawn heuristics
+          // reduce their density for multiplayer games. This prevents generateGameItems()
+          // from producing a full solo-sized set when we are actually running an authoritative run.
+          serverAuthoritative = true;
+
+          serverStartEpoch = startEpoch;
+          const roomsStateInner = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+          const inRoom = roomsStateInner && roomsStateInner.room;
+          const isAdmin = roomsStateInner && roomsStateInner.isAdmin;
+
+            if (Array.isArray(data && data.items) && data.items.length) {
+            // Use server-supplied scheduled items when available
+            scheduledGameItems = data.items.slice();
+
+            // If this is a multiplayer authoritative run, reduce the client-side visual density
+            // by sampling the scheduled list according to SERVER_SPAWN_MULTIPLIER. Use the
+            // deterministic RNG when seeded so clients remain visually consistent.
+            try {
+              if (serverAuthoritative && Array.isArray(scheduledGameItems) && scheduledGameItems.length > 8) {
+                try {
+                  const sampled = [];
+                  for (let i = 0; i < scheduledGameItems.length; i++) {
+                    const r = (typeof deterministicRng === 'function') ? deterministicRng() : Math.random();
+                    if (r < SERVER_SPAWN_MULTIPLIER) sampled.push(scheduledGameItems[i]);
+                  }
+                  // If sampling removed everything (rare), fall back to taking every-other item
+                  if (sampled.length && sampled.length > 0) {
+                    scheduledGameItems = sampled;
+                  } else {
+                    scheduledGameItems = scheduledGameItems.filter((_, i) => (i % 2) === 0);
+                  }
+                } catch (innerE) {
+                  // conservative fallback: every-other item
+                  scheduledGameItems = scheduledGameItems.filter((_, i) => (i % 2) === 0);
+                }
+              }
+            } catch (e) { /* ignore trimming failures */ }
+
+          } else if (inRoom && !isAdmin) {
+            // In a room and not admin: do NOT locally generate authoritative items.
+            // Clients should await authoritative items from the server to ensure identical state.
+            scheduledGameItems = [];
+            console.warn('No items provided by server; awaiting authoritative items from server for room participants.');
+          } else {
+            // Solo play or admin: generate deterministic items locally from seed as a fallback
+            // serverAuthoritative already true above, so generateGameItems will reduce density accordingly.
+            scheduledGameItems = generateGameItems(currentGameId, seed) || [];
+          }
+        } catch (e) {
+          scheduledGameItems = scheduledGameItems || [];
+          // If anything fails, be conservative and ensure serverAuthoritative is unset so we don't accidentally shrink caps elsewhere.
+          serverAuthoritative = false;
+          console.warn('Failed to prepare scheduled game items', e);
         }
 
         // Seed deterministic RNG to ensure synchronized spawn/maze generation
@@ -6118,7 +7295,7 @@ if (window.NET) {
         const initializeGameState = () => {
           try {
             console.log(`Initializing synchronized game state for ${currentGameId}`);
-
+            
             // Only clear to black when the camera/video is not producing frames yet.
             // Clearing unconditionally can produce a visible black screen while the camera warms up.
             try {
@@ -6127,86 +7304,90 @@ if (window.NET) {
                 ctx.fillRect(0, 0, canvas.width / DPR, canvas.height / DPR);
               }
             } catch (e) { /* ignore canvas clear failures */ }
-
+            
             // Reset all state
             score = 0;
             objects.length = 0;
             particles.length = 0;
             popups.length = 0;
-
+            
             // Clear mode-specific state
             if (paintPaths) paintPaths.length = 0;
             if (shapes) shapes.length = 0;
             if (shapeCovered) shapeCovered.length = 0;
-
-            // Use server-provided game state if available
-            if (serverGameState && serverGameState.objects) {
-              // Load server-generated objects
-              objects.push(...serverGameState.objects.map(obj => ({
-                ...obj,
-                sliced: false // Reset sliced state for local interaction
-              })));
-
-              console.log(`Loaded ${serverGameState.objects.length} objects from server`);
-            }
-
+            
             // Mode-specific initialization with seed
             if (currentGameId === 'runner-control') {
               runnerControlModule.onStart && runnerControlModule.onStart();
             } else if (currentGameId === 'maze-mini') {
               mazeModule.onStart && mazeModule.onStart();
             } else if (currentGameId === 'shape-trace') {
-              if (serverGameState && serverGameState.shape) {
-                // Use server-provided shape
-                shapes = [{
-                  type: serverGameState.shape.type,
-                  points: serverGameState.shape.points
-                }];
-                shapeCovered = new Array(Math.max(0, serverGameState.shape.points.length - 1)).fill(false);
-                window.__handNinja._shapeCoveredCount = 0;
-                shapeIndex = 0;
-                shapeProgress = 0;
-                console.log(`Loaded server shape: ${serverGameState.shape.type}`);
-              } else {
-                const s = generateRandomShape();
-                shapes = [s];
-                shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
-                window.__handNinja._shapeCoveredCount = 0;
-                shapeIndex = 0;
-                shapeProgress = 0;
-              }
+              const s = generateRandomShape();
+              shapes = [s];
+              shapeCovered = new Array(Math.max(0, s.points.length - 1)).fill(false);
+              window.__handNinja._shapeCoveredCount = 0;
+              shapeIndex = 0;
+              shapeProgress = 0;
             } else if (currentGameId === 'paint-air') {
               paintPaths.length = 0;
               paintTrack.length = 0;
               paintOnTrackLen = 0;
               paintModeNoTimer = true;
               showPaintToolbar(true);
-            } else if (currentGameId === 'maze-mini' && serverGameState && serverGameState.maze) {
-              // Use server-provided maze
-              console.log('Using server-provided maze');
             }
-
+            
             // Align local timers and spawn anchors
             startTime = performance.now();
             lastFrameTime = performance.now();
             lastFruitSpawn = startTime;
             lastBombSpawn = startTime;
-
-            // Start BGM per music controller policy (admin vs non-admin / server-forced)
+            
+            // Start music at game begin - both solo and multiplayer
             try {
-              const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
-              if (mc && typeof mc.onGameBegin === 'function') {
-                mc.onGameBegin(data);
+              const mc = window.__handNinja && window.__handNinja.musicController;
+              const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+              const isAdmin = !!(roomsState && roomsState.isAdmin);
+              const forcePlayAll = !!(data && data.forcePlayAll);
+
+              // Policy:
+              // - If server forces playback (forcePlayAll), start BGM on all clients.
+              // - Otherwise start only when local preference allows it (musicEnabled) AND client is admin or not in a room.
+              // - If not starting, preload/decode the BGM so it can start quickly when allowed.
+              if (mc && typeof mc.startGame === 'function') {
+                if (forcePlayAll || (musicEnabled && (!roomsState || isAdmin))) {
+                  // Use controller API to start music; controller should handle user gesture requirements and fallbacks.
+                  try { mc.startGame(); } catch (e) { console.warn('musicController.startGame failed, falling back', e); }
+                  console.log('Game music started (policy allowed) on game_begin');
+                } else {
+                  // Preload but do not autoplay for non-admin room users or when music disabled.
+                  try { if (ASSETS && ASSETS.bgm) decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e){}
+                  console.log('Game music preloaded (not auto-starting) on game_begin');
+                }
               } else {
-                if (musicEnabled && ASSETS && ASSETS.bgm) {
-                  try { playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true }); } catch(e){ try { playSound('bgm'); } catch(e){} }
+                // No controller available: fallback to direct playback or preload.
+                if (forcePlayAll || (musicEnabled && (!roomsState || isAdmin))) {
+                  try {
+                    if (ASSETS && ASSETS.bgm) {
+                      playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true });
+                    } else {
+                      playSound('bgm');
+                    }
+                  } catch (e) {
+                    try { playSound('bgm'); } catch (e2) {}
+                  }
+                  console.log('Fallback game music started (policy allowed) on game_begin');
+                } else {
+                  try { if (ASSETS && ASSETS.bgm) decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e){}
+                  console.log('Fallback: preloaded BGM (not auto-starting) on game_begin');
                 }
               }
-            } catch (e) { console.warn('BGM start on game_begin failed', e); }
-
+            } catch (e) { console.warn('BGM start gating failed on game_begin', e); }
+            
             running = true;
             menuEl.style.display = 'none';
-
+            // ensure UI reflects run state immediately (show Leave button)
+            try { updateUI(); } catch (e) {}
+            
             // Set appropriate start message
             if (currentGameId === 'ninja-fruit') {
               noticeEl.textContent = 'Multiplayer game started — slice fruits, avoid bombs!';
@@ -6221,10 +7402,10 @@ if (window.NET) {
             } else {
               noticeEl.textContent = 'Multiplayer game started!';
             }
-
+            
             console.log(`Game state initialized successfully for ${currentGameId}`);
-
-          } catch(e) {
+            
+          } catch(e) { 
             console.error('Game state initialization failed:', e);
             noticeEl.textContent = 'Game initialization failed - check console';
           }
@@ -6240,66 +7421,6 @@ if (window.NET) {
       } catch (e) { console.error('game_begin handler failed:', e); }
     });
 
-    // Handle score updates from server
-    NET.on('score_update', (data) => {
-      try {
-        if (!data) return;
-        roomScores = data.scores || {};
-
-        // Update local score display if it's our score
-        if (localPlayerId && data.playerId === localPlayerId) {
-          score = data.score || 0;
-          updateUI();
-        }
-
-        console.log('Score update:', data);
-      } catch (e) {
-        console.warn('score_update handler failed:', e);
-      }
-    });
-
-    // Handle object hit notifications from server
-    NET.on('object_hit', (data) => {
-      try {
-        if (!data) return;
-
-        const { objectId, hitType, points, playerId, playerName, scores } = data;
-
-        // Update room scores
-        roomScores = scores || {};
-
-        // Find and mark the object as sliced locally
-        const obj = objects.find(o => o.id === objectId);
-        if (obj && !obj.sliced) {
-          obj.sliced = true;
-          obj.slicedBy = playerId;
-          obj.slicedAt = Date.now();
-
-          // Show hit effects
-          const fx = obj.x, fy = obj.y;
-          if (obj.type === 'bomb') {
-            spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 18);
-            spawnPopup(fx, fy, `-${points} (${playerName})`, { col: 'rgba(255,80,80,0.95)', size: 16 });
-            playSound('bomb');
-          } else {
-            spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 12);
-            spawnPopup(fx, fy, `+${points} (${playerName})`, { col: 'rgba(255,240,200,1)', size: 16 });
-            playSound('slice');
-          }
-
-          // Remove object after delay
-          setTimeout(() => {
-            const idx = objects.findIndex(o => o.id === objectId);
-            if (idx !== -1) objects.splice(idx, 1);
-          }, 80);
-        }
-
-        console.log('Object hit:', data);
-      } catch (e) {
-        console.warn('object_hit handler failed:', e);
-      }
-    });
-
     // Optional: update local UI when room metadata changes
     NET.on('room_update', (data) => {
       try {
@@ -6313,12 +7434,131 @@ if (window.NET) {
         // Apply admin-selected game BGM for all clients — update asset mapping but do not force playback here
         try { if (typeof updateGameBGM === 'function' && data && data.game) updateGameBGM(data.game, { force: false }); } catch (e) { console.warn('updateGameBGM failed on room_update', e); }
 
+        // If the admin changed the selected game for the room, treat this as a room-level reset
+        // but only apply the zero-reset when it makes sense:
+        // - do not clobber a live higher peer/local score for the same game
+        // - prefer to reset when there is no positive live score (so the UI shows a clean "0" for a fresh game)
+        // This prevents an unconditional room-wide zero that would hide valid live highs when players are mid-game.
+        try {
+          if (data && data.game) {
+            const gid2 = String(data.game);
+            // compute best live score among peers (and local) to avoid overwriting a real high
+            let bestLiveScore = 0;
+            try {
+              // consider recent peers only (reuse presence threshold used elsewhere)
+              const PRESENCE_THRESHOLD_MS = 120000;
+              const nowTs = Date.now();
+              for (const st of Object.values(peerGhosts || {})) {
+                try {
+                  if (!st || typeof st.score !== 'number') continue;
+                  if (!st.lastTs || (nowTs - Number(st.lastTs)) > PRESENCE_THRESHOLD_MS) continue;
+                  if (Number(st.score) > bestLiveScore) bestLiveScore = Number(st.score);
+                } catch(e){}
+              }
+              // also include local player's current score when it's for the same selected game
+              try {
+                const sel = document.getElementById('gameSelect');
+                const selected = sel && sel.value ? String(sel.value) : currentGameId;
+                if (selected === gid2 && typeof score === 'number' && Number(score) > bestLiveScore) bestLiveScore = Number(score);
+              } catch(e){}
+            } catch (e) { /* ignore live-scan failures */ }
+
+            const clientId = (function() { try { return localStorage.getItem('hand_ninja_client_id'); } catch(e) { return null; } })();
+
+            // Apply reset only when there is no live positive score to preserve the true room best.
+            if (bestLiveScore <= 0) {
+              const resetEntry = { name: 'Player', score: 0, game: gid2, clientId: clientId || null };
+              // mark as a server-provided reset so clients consider it authoritative now
+              resetEntry._serverTs = Date.now();
+              roomHighScoresByGame[gid2] = resetEntry;
+              roomHighScore = roomHighScoresByGame[gid2];
+              try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+            } else {
+              // If there's a live best, do not overwrite server cache; instead ensure display refresh
+              try {
+                if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay();
+              } catch(e){}
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to apply room_update reset for game', data && data.game, e);
+        }
+
         // show a short notice when admin changes options
         if (typeof noticeEl !== 'undefined' && noticeEl) {
           noticeEl.textContent = `Room updated: ${data.game || ''} · ${data.timeLimit || ''}s`;
           setTimeout(()=> { try { noticeEl.textContent = ''; } catch(e){} }, 1400);
         }
       } catch(e){ console.warn('room_update handler failed', e); }
+    });
+
+    // Server may emit explicit music control events to start/stop BGM across clients.
+    // These handlers respect room/admin policy and local user preference unless the server forces playback.
+    NET.on('music_play', (data) => {
+      try {
+        data = data || {};
+        // allow server to override the BGM asset
+        if (data.bgmUrl) {
+          ASSETS.bgm = data.bgmUrl;
+          try { if (window.__handNinja && window.__handNinja._simpleAudio) window.__handNinja._simpleAudio.map.bgm = data.bgmUrl; } catch(e){}
+        }
+
+        const forcePlayAll = !!data.forcePlayAll;
+        const mc = window.__handNinja && window.__handNinja.musicController;
+
+        // Prefer the centralized music controller when available
+        if (mc && typeof mc.startGame === 'function') {
+          if (forcePlayAll) {
+            mc.startGame();
+          } else {
+            // Only auto-start when allowed: either not in a room, or user is admin, and user has music enabled.
+            const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+            const allowed = !(roomsState && roomsState.room) || (roomsState && roomsState.isAdmin);
+            if (musicEnabled && allowed) {
+              mc.startGame();
+            } else {
+              // Preload/decode for faster start if user later enables/admits playback
+              try { if (ASSETS && ASSETS.bgm) decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e){}
+            }
+          }
+          return;
+        }
+
+        // Fallback legacy behavior when musicController missing
+        if (forcePlayAll || (musicEnabled && (!(window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.room) || (window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.isAdmin)))) {
+          try { playDecodedBgm(ASSETS && ASSETS.bgm, { vol: 0.8, loop: true }); } catch(e){ try { playSound('bgm'); } catch(e){} }
+        } else {
+          try { if (ASSETS && ASSETS.bgm) decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e){}
+        }
+      } catch(e) { console.warn('music_play handler failed', e); }
+    });
+
+    NET.on('music_stop', (data) => {
+      try {
+        data = data || {};
+        const forceStopAll = !!data.forceStopAll;
+        const mc = window.__handNinja && window.__handNinja.musicController;
+        if (mc && typeof mc.stopGame === 'function') {
+          if (forceStopAll) {
+            mc.stopGame();
+          } else {
+            // Only stop for solo/admin clients; do not forcibly stop non-admin room users unless server requested.
+            const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+            const allowed = !(roomsState && roomsState.room) || (roomsState && roomsState.isAdmin);
+            if (allowed) mc.stopGame();
+            // otherwise leave client preference intact but ensure preload/decoded buffers are cleared
+            else try { stopDecodedBgm(); } catch(e){}
+          }
+          return;
+        }
+
+        // legacy fallback
+        if (forceStopAll || (!(window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.room) || (window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.isAdmin))) {
+          try { stopAllAudio(); } catch(e){}
+        } else {
+          try { stopDecodedBgm(); } catch(e){}
+        }
+      } catch(e) { console.warn('music_stop handler failed', e); }
     });
 
     // Peer hand updates: receive quantized payloads from other clients and render ghost hands
@@ -6520,6 +7760,32 @@ if (window.NET) {
         }
 
         peerGhosts[id] = st;
+        // If this peer reports a score and we previously stored a room high with that score,
+        // update the stored entry's name when the peer's name arrives later.
+        try {
+          if (st && typeof st.score === 'number') {
+            for (const gid of Object.keys(roomHighScoresByGame || {})) {
+              try {
+                const existing = roomHighScoresByGame[gid];
+                if (existing && typeof existing.score === 'number' && existing.score === st.score && existing.name !== st.name) {
+                  roomHighScoresByGame[gid] = Object.assign({}, existing, { name: st.name });
+                  if (gid === currentGameId) {
+                    try { updateRoomHighScoreDisplay(); } catch(e){}
+                  }
+                }
+              } catch(e){}
+            }
+          }
+        } catch(e){}
+
+        // Recompute local peer display names to avoid duplicate visible names,
+        // then ensure the local player's name suggestion remains unique.
+        try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+        try { if (typeof ensureLocalNameUnique === 'function') ensureLocalNameUnique(); } catch(e){}
+
+        // Keep room high score UI in sync after peer name/score/name-disambiguation changes.
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+
         console.debug && console.debug(`Updated peer ghost ${id}: ${convertedHands.length} hand(s), name: ${st.name}`);
         try { if (typeof window !== 'undefined' && typeof window.__peerDebugUpdate === 'function') window.__peerDebugUpdate(id, 'hand'); } catch(e){}
       } catch (err) {
@@ -6609,6 +7875,194 @@ if (window.NET) {
     }
 
     NET.on('peer_paint', handlePeerPaint);
+
+    // Room-level high-score (simplified admin-driven model). Server emits when a new room high is achieved.
+    NET.on('room_highscore', (data) => {
+      try {
+        if (!data) return;
+        console.log('Received room_highscore:', data);
+        // Cache per-game so UI helpers can prefer live/local names and apply heuristics consistently.
+        const gid = (data && data.game) ? String(data.game) : currentGameId || 'default';
+        // store a shallow copy but DO NOT blindly stamp a local recv timestamp.
+        // Prefer explicit server-provided timestamps when present. If the server did not
+        // include a timestamp, preserve any previous _serverTs so recent local resets
+        // aren't clobbered by server payloads that lack timing metadata.
+        try {
+          // preserve previous server timestamp before we overwrite the entry
+          const prevServerTs = (roomHighScoresByGame[gid] && Number(roomHighScoresByGame[gid]._serverTs)) ? Number(roomHighScoresByGame[gid]._serverTs) : 0;
+          const serverProvidedTs = (data && (Number(data._serverTs) || Number(data.ts) || Number(data.t) || Number(data.updatedAt) || Number(data.updated))) 
+            ? Number(data._serverTs || data.ts || data.t || data.updatedAt || data.updated) 
+            : 0;
+
+          roomHighScoresByGame[gid] = Object.assign({}, data || {});
+          if (serverProvidedTs) {
+            // use server-supplied timestamp when available
+            roomHighScoresByGame[gid]._serverTs = serverProvidedTs;
+          } else {
+            // preserve previous server ts (or leave as 0) to avoid overwriting a recent local reset
+            roomHighScoresByGame[gid]._serverTs = prevServerTs || 0;
+          }
+        } catch (e) {
+          // fallback: store original object if shallow copy fails
+          roomHighScoresByGame[gid] = data;
+        }
+        roomHighScore = roomHighScoresByGame[gid];
+
+        // Let the centralized display updater handle name resolution (prefers local/peer names when applicable).
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+
+        const roomHighScoreEl = document.getElementById('roomHighScore');
+        if (roomHighScoreEl && roomHighScore && typeof roomHighScore.score === 'number') {
+          const name = (roomHighScore.name || 'Player').slice(0, 12);
+          const score = roomHighScore.score;
+          roomHighScoreEl.textContent = `Room Best: ${name}: ${score}`;
+          roomHighScoreEl.setAttribute('data-visible', 'true');
+          roomHighScoreEl.style.display = 'inline-block';
+          console.log('Updated room high score display:', name, score);
+        } else {
+          console.log('Could not update room high score display - element not found or invalid data');
+        }
+      } catch(e) {
+        console.warn('room_highscore handler failed', e);
+      }
+    });
+
+    // Peer score updates forwarded from server (id + score). Update peerGhosts and show a small popup.
+    NET.on('peer_score', (payload) => {
+      try {
+        if (!payload) return;
+        const id = payload.id || payload.clientId || payload.peerId || payload.from;
+        const sc = Number(payload.score) || 0;
+        if (!id) return;
+
+        // Update peer ghost state
+        const st = peerGhosts[id] || {};
+        st.score = sc;
+        peerGhosts[id] = st;
+
+        // Dynamically update the room high-score for the current game when peers report scores.
+        // Prefer payload.game if provided; otherwise assume currentGameId.
+        try {
+          const gameOfScore = (payload && payload.game) ? String(payload.game) : currentGameId;
+          if (gameOfScore) {
+            const gid = gameOfScore;
+            const existing = roomHighScoresByGame[gid] || null;
+            if (!existing || sc > (existing.score || 0)) {
+              // preserve previous server timestamp when payload omits timing fields
+              const prevServerTs = (roomHighScoresByGame[gid] && Number(roomHighScoresByGame[gid]._serverTs)) ? Number(roomHighScoresByGame[gid]._serverTs) : 0;
+              const serverProvidedTs = (payload && (Number(payload._serverTs) || Number(payload.ts) || Number(payload.t) || Number(payload.updatedAt) || Number(payload.updated))) 
+                ? Number(payload._serverTs || payload.ts || payload.t || payload.updatedAt || payload.updated) 
+                : 0;
+
+              roomHighScoresByGame[gid] = Object.assign({}, { name: st.name || payload.name || 'Player', score: sc, game: gid });
+              if (serverProvidedTs) {
+                roomHighScoresByGame[gid]._serverTs = serverProvidedTs;
+              } else {
+                roomHighScoresByGame[gid]._serverTs = prevServerTs || 0;
+              }
+
+              // Refresh display if this is the active game
+              if (gid === currentGameId) updateRoomHighScoreDisplay();
+            }
+          }
+        } catch (e) { /* ignore highscore update failures */ }
+
+        // Re-run peer-name deduplication so any duplicate names visible in the room are disambiguated,
+        // and refresh the room-high UI to reflect the latest peer-driven values.
+        try { if (typeof dedupePeerDisplayNames === 'function') dedupePeerDisplayNames(); } catch(e){}
+        try { if (typeof updateRoomHighScoreDisplay === 'function') updateRoomHighScoreDisplay(); } catch(e){}
+
+        // If this score belongs to us (our socket id), adopt authoritative score immediately
+        try {
+          if (NET && NET.socket && NET.socket.id && id === NET.socket.id) {
+            score = sc;
+            updateUI();
+            // show a subtle confirmation popup near HUD
+            try { spawnPopup((canvas.width / DPR) - 80, 40, `Score: ${sc}`, { col: 'yellow', size: 14 }); } catch(e){}
+          }
+        } catch (e) { /* ignore */ }
+
+        // show small popup near peer anchor if available (for remote peers)
+        const anchor = (st && st.displayHands && st.displayHands[0] && st.displayHands[0][8]) ? st.displayHands[0][8] : null;
+        if (anchor && id !== (NET && NET.socket && NET.socket.id)) {
+          spawnPopup(anchor.x, anchor.y - 30, `${st.name || 'Player'}: ${sc}`, { col: 'yellow', size: 14 });
+        }
+      } catch(e){ console.warn('peer_score handler failed', e); }
+    });
+
+    // Server-initiated kick: perform the same cleanup as leaving the room.
+    NET.on('kicked', (data) => {
+      try {
+        console.log('Received kicked event from server', data);
+        try { cleanupAfterLeave(); } catch(e){ console.warn('cleanupAfterLeave failed in kicked handler', e); }
+        try { noticeEl.textContent = 'You were removed from the room'; setTimeout(() => { noticeEl.textContent = ''; }, 2000); } catch(e){}
+      } catch (e) {
+        console.warn('kicked handler failed', e);
+      }
+    });
+
+    // Authoritative object state updates from server (e.g. removed items). Reconcile optimistic state.
+    NET.on('object_state', (data) => {
+      try {
+        if (!data || !data.id) return;
+        const objId = data.id;
+        const removed = !!data.removed;
+        const by = data.by || data.clientId || data.from;
+        // find object locally (may be present as tentative)
+        const idx = objects.findIndex(o => o.id === objId);
+        if (removed) {
+          // If object exists, remove and reconcile with any optimistic local state.
+          if (idx !== -1) {
+            const obj = objects[idx];
+            const fx = obj.x, fy = obj.y;
+
+            // If the client already applied an optimistic score for this object,
+            // treat this as authoritative confirmation and avoid duplicating effects.
+            if (obj._optimisticScore) {
+              // If server provided an authoritative score, adopt it; otherwise keep optimistic value.
+              if (typeof data.score === 'number') {
+                score = Number(data.score);
+              }
+              // Clean up optimistic bookkeeping
+              try { clearTimeout(obj._optimisticTimer); } catch(e){}
+              obj._pendingInteraction = false;
+              obj._tentativeRemove = false;
+              obj._optimisticScore = 0;
+              updateUI();
+              // Do not spawn duplicate visual/audio since optimistic UI already displayed.
+            } else {
+              // No optimistic state: spawn authoritative particles / popup based on type
+              if (obj.type === 'bomb') {
+                spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 18);
+                spawnPopup(fx, fy, '-20', { col: 'rgba(255,80,80,0.95)', size: 20 });
+                try { playSound('bomb'); } catch(e){}
+              } else {
+                spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 12);
+                spawnPopup(fx, fy, '+10', { col: 'rgba(255,240,200,1)', size: 16 });
+                try { playSound('slice'); } catch(e){}
+              }
+            }
+
+            // remove from objects
+            objects.splice(idx, 1);
+          } else {
+            // object already removed locally or never spawned; ignore
+          }
+        } else {
+          // server says object is not removed (possible rejection) -> revert tentative flags if present
+          if (idx !== -1) {
+            const obj = objects[idx];
+            if (obj._tentativeRemove) {
+              obj._tentativeRemove = false;
+              obj._pendingInteraction = false;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('object_state handler failed', e);
+      }
+    });
+
     // DOM fallback for net:peer_paint
     try { window.addEventListener && window.addEventListener('net:peer_paint', (e) => { try { handlePeerPaint(e && e.detail ? e.detail : e); } catch(ex){} }); } catch(e){}
   } catch (e) {
@@ -6616,53 +8070,16 @@ if (window.NET) {
   }
 }
 
- // Expose some debug hooks (optional)
- // diagnostic banner + optional auto-connect (safe, reversible)
- (function(){
-   try {
-     if (typeof document !== 'undefined' && !document.getElementById('peerDebugBanner')) {
-       const b = document.createElement('div');
-       b.id = 'peerDebugBanner';
-       Object.assign(b.style, {
-         position: 'fixed',
-         left: '12px',
-         bottom: '12px',
-         padding: '8px 10px',
-         background: 'rgba(0,0,0,0.6)',
-         color: '#fff',
-         fontSize: '12px',
-         borderRadius: '6px',
-         zIndex: 999999,
-         pointerEvents: 'none'
-       });
-       b.textContent = 'Peers: 0 | Paints: 0';
-       try { document.body.appendChild(b); } catch(e){}
+ // Auto-connect NET if available and not explicitly disabled by window.__handNinja.noAutoConnect
+ try {
+   if (typeof NET !== 'undefined' && NET && !NET.connected) {
+     var skip = false;
+     try { skip = !!(window.__handNinja && window.__handNinja.noAutoConnect); } catch(e){}
+     if (!skip) {
+       try { NET.connect(location.origin); } catch(e){}
      }
-   } catch(e){}
-
-   // updater used by peer handlers
-   try {
-     window.__peerDebugUpdate = function(lastId, kind) {
-       try {
-         const el = (typeof document !== 'undefined') ? document.getElementById('peerDebugBanner') : null;
-         const peerCount = Object.keys(peerGhosts || {}).length;
-         const paintCount = Object.keys(peerPaints || {}).length;
-         if (el) el.textContent = `Peers: ${peerCount} | Paints: ${paintCount}${lastId ? ' | last: ' + lastId + ':' + kind : ''}`;
-       } catch(e){}
-     };
-   } catch(e){}
-
-   // Auto-connect NET if available and not explicitly disabled by window.__handNinja.noAutoConnect
-   try {
-     if (typeof NET !== 'undefined' && NET && !NET.connected) {
-       var skip = false;
-       try { skip = !!(window.__handNinja && window.__handNinja.noAutoConnect); } catch(e){}
-       if (!skip) {
-         try { NET.connect(location.origin); } catch(e){}
-       }
-     }
-   } catch(e){}
- })();
+   }
+ } catch(e){}
 
 window.__handNinja = {
   spawnFruit,
