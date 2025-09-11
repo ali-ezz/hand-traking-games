@@ -233,8 +233,8 @@
   "shape-trace": [
     {
       "name": "Player",
-      "score": 676,
-      "ts": 1757231394970
+      "score": 1316,
+      "ts": 1757574097185
     },
     {
       "name": "Huhu",
@@ -244,14 +244,14 @@
   ],
   "paint-air": [
     {
+      "name": "Player",
+      "score": 100,
+      "ts": 1757571192928
+    },
+    {
       "name": "Huhu",
       "score": 0,
       "ts": 1757045494886
-    },
-    {
-      "name": "Player",
-      "score": 0,
-      "ts": 1757048082806
     },
     {
       "name": "جامعه حلوان الاهليه",

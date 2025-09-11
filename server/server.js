@@ -8,7 +8,7 @@ const path = require('path');
 
 const APP_PORT = process.env.PORT || 3000;
 const ROOM_ID_SIZE = 6;
-const ROOM_CAP = 50;
+const ROOM_CAP = 200;
 const LEADERBOARD_FILE = path.join(__dirname, 'leaderboard.json');
 
 const app = express();

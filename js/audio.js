@@ -120,8 +120,12 @@ Fallback:
         const mc = window.__handNinja && window.__handNinja.musicController;
         const url = this.map && this.map[key];
         const isBgmKey = (key && (key === 'bgm' || key.startsWith('bgm'))) || (url && /bgm/i.test(url));
+        // Respect caller's explicit intent to force-start, otherwise allow musicController to
+        // decide (e.g. prevent non-admin autoplay). Callers can pass { force: true } when
+        // they truly intend to override policy.
+        const forceStart = !!(opts && opts.force);
         if (mc && isBgmKey && url) {
-          mc.start(url, { force: true, vol });
+          mc.start(url, { force: forceStart, vol });
           return;
         }
       } catch (e) {}
@@ -175,6 +179,20 @@ Fallback:
             if (this._htmlBgm) try { this._htmlBgm.pause(); } catch(e){}
             const src = this.map[key];
             if (!src) return;
+
+            // If a centralized musicController exists, prefer handing the URL to it so it can
+            // enforce room/admin autoplay policy (e.g. preload-only for non-admins).
+            try {
+              const mc = window.__handNinja && window.__handNinja.musicController;
+              if (mc) {
+                mc.start(src, { force: false, vol });
+                // The controller will manage playback/preload; don't create a native Audio here.
+                this._htmlBgm = null;
+                this._htmlBgmKey = key;
+                return;
+              }
+            } catch (e){}
+
             const a = new Audio(src);
             a.loop = true;
             a.volume = vol;
@@ -193,7 +211,8 @@ Fallback:
       try {
         const mc = window.__handNinja && window.__handNinja.musicController;
         if (mc) {
-          mc.stop({ force: true });
+          const forceStop = !!(opts && opts.force);
+          mc.stop({ force: forceStop });
           return;
         }
       } catch (e) {}
