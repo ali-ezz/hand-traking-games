@@ -1,6 +1,7 @@
 // JavaScript
 // Minimal SimpleAudio helper (quick-fix static path)
-// Provides: initOnFirstInteraction(), playBgm(key, vol), stopBgm(), playSfx(key)
+// Provides: initOnFirstInteraction(), playBgm(key, vol, opts), stopBgm(opts), playSfx(key)
+// This version delegates BGM lifecycle to window.__handNinja.musicController when available.
 // Fallback friendly — safe to include even if game.js already has a similar inline fallback.
 (function(){
   if (window._SimpleAudio) return;
@@ -11,6 +12,7 @@
       this.unlocked = false;
       this.bgm = null;
       this.bgmKey = null;
+      this._controllerStarted = false;
     }
     initOnFirstInteraction(){
       const unlock = () => {
@@ -32,22 +34,39 @@
       window.addEventListener('pointerdown', unlock, { once: true, passive: true });
       window.addEventListener('touchstart', unlock, { once: true, passive: true });
     }
-    playBgm(key, vol = 0.6){
+    playBgm(key, vol = 0.6, opts = {}){
       // Prefer centralized musicController for BGM-like keys/URLs.
-      // Call the controller before checking unlocked so non-admins can preload while admins may start playback.
+      // Ask the controller to preload the BGM; only ask it to start when allowed
+      // (force === true OR client not in room OR client is admin). Otherwise preload only.
       try {
         const mc = window.__handNinja && window.__handNinja.musicController;
         const url = this.map && this.map[key];
         const isBgmKey = (key && (key === 'bgm' || key.startsWith('bgm'))) || (url && /bgm/i.test(url));
+        const forceStart = !!(opts && opts.force);
         if (mc && isBgmKey && url) {
-          // Ask the controller to start; controller will enforce room/admin policy
-          // and may only preload when autoplay is not allowed.
-          mc.start(url, { force: false, vol });
+          // Preload for faster later start (controller may noop if unsupported).
+          try { mc.preload && mc.preload(url).catch(()=>{}); } catch(e){}
+          // Decide if controller should actually start playback now.
+          let allowStart = forceStart;
+          try {
+            const state = (typeof mc.getState === 'function') ? mc.getState() : null;
+            const inRoom = state && !!state.inRoom;
+            const isAdmin = state && !!state.isAdmin;
+            // If not in a room (single-player) or the client is admin, allow immediate start.
+            if (!inRoom || isAdmin) allowStart = true;
+          } catch(e){}
+          if (allowStart) {
+            try { mc.start && mc.start(url, { force: forceStart, vol }).catch(()=>{}); } catch(e){}
+            this._controllerStarted = true;
+          } else {
+            this._controllerStarted = false;
+          }
           this.bgmKey = key;
+          // Do not create local Audio when controller is present.
           return;
         }
       } catch(e){}
-      // If audio system hasn't been unlocked, avoid creating/playing HTMLAudio.
+      // Fallback: local HTMLAudio looped BGM.
       if (!this.unlocked) return;
       if (this.bgm && this.bgmKey === key) return;
       if (this.bgm){ try { this.bgm.pause(); } catch(e){} this.bgm = null; }
@@ -58,14 +77,22 @@
       try { a.volume = vol; } catch(e){}
       a.play().catch(()=>{});
       this.bgm = a; this.bgmKey = key;
+      this._controllerStarted = false;
     }
-    stopBgm(){
+    stopBgm(opts = {}){
+      const forceStop = !!(opts && opts.force);
       try {
         const mc = window.__handNinja && window.__handNinja.musicController;
-        if (mc) { mc.stop({ force: false }); }
+        // If controller started the bgm on behalf of this client, delegate stop to it.
+        // Also allow forced stop to be delegated regardless of who started it.
+        if (mc && (this._controllerStarted || forceStop)) {
+          try { mc.stop && mc.stop({ force: forceStop }); } catch(e){}
+          this._controllerStarted = false;
+        }
       } catch(e){}
       if (this.bgm) try { this.bgm.pause(); } catch(e){}
       this.bgm = null; this.bgmKey = null;
+      this._controllerStarted = false;
     }
     playSfx(key, vol = 1){
       if (!this.unlocked) return;

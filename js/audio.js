@@ -125,7 +125,12 @@ Fallback:
         // they truly intend to override policy.
         const forceStart = !!(opts && opts.force);
         if (mc && isBgmKey && url) {
-          mc.start(url, { force: forceStart, vol });
+          // Ask controller to preload for faster future start; controller will noop if unsupported.
+          try { mc.preload && mc.preload(url).catch(()=>{}); } catch(e){}
+          // Do not auto-start here; centralized controller manages when playback begins.
+          // The helper will only preload the asset for faster future start.
+          this._controllerPreloaded = true;
+          // In all cases avoid local autoplay; controller manages playback. Return early.
           return;
         }
       } catch (e) {}
@@ -182,16 +187,17 @@ Fallback:
 
             // If a centralized musicController exists, prefer handing the URL to it so it can
             // enforce room/admin autoplay policy (e.g. preload-only for non-admins).
-            try {
-              const mc = window.__handNinja && window.__handNinja.musicController;
-              if (mc) {
-                mc.start(src, { force: false, vol });
-                // The controller will manage playback/preload; don't create a native Audio here.
-                this._htmlBgm = null;
-                this._htmlBgmKey = key;
-                return;
-              }
-            } catch (e){}
+              try {
+                const mc = window.__handNinja && window.__handNinja.musicController;
+                if (mc) {
+                  // Preload via centralized controller; do not auto-start playback here.
+                  try { mc.preload && mc.preload(src).catch(()=>{}); } catch(e){}
+                  // The controller will manage playback/preload; don't create a native Audio here.
+                  this._htmlBgm = null;
+                  this._htmlBgmKey = key;
+                  return;
+                }
+              } catch (e){}
 
             const a = new Audio(src);
             a.loop = true;
@@ -212,7 +218,11 @@ Fallback:
         const mc = window.__handNinja && window.__handNinja.musicController;
         if (mc) {
           const forceStop = !!(opts && opts.force);
-          mc.stop({ force: forceStop });
+          // Only ask controller to stop if caller forced it or controller previously started playback.
+          if (forceStop || this._controllerStarted) {
+            try { mc.stop({ force: forceStop }); } catch(e){}
+            this._controllerStarted = false;
+          }
           return;
         }
       } catch (e) {}

@@ -1629,7 +1629,7 @@ try {
       const isLikelyBgm = (ASSETS && ASSETS.bgm && url && url === ASSETS.bgm) || (typeof url === 'string' && /bgm/i.test(url));
       if (mc && typeof mc.start === 'function' && isLikelyBgm) {
         // Use controller and force play when callers requested direct start
-        mc.start(url, { force: true, vol: volume }).catch(() => {});
+        mc.start(url, { force: !!(opts && opts.force), vol: volume }).catch(() => {});
         return true;
       }
     } catch (e) {
@@ -1830,6 +1830,19 @@ if (!window._SimpleAudio) {
         if (this.bgm){ try { this.bgm.pause(); } catch(e){} this.bgm = null; }
         const src = (this.buff[key] && this.buff[key].src) ? this.buff[key].src : (this.map[key] || null);
         if (!src) return;
+        // Prefer centralized music controller for BGM lifecycle so room/admin policy and user toggle are honored.
+        try {
+          const mc = window.__handNinja && window.__handNinja.musicController;
+          if (key === 'bgm' && mc && typeof mc.start === 'function') {
+            // mark that controller was used by this SimpleAudio instance
+            this._controllerStarted = true;
+            this.bgmKey = key;
+            this.bgm = null;
+            // request controller to start (it will respect in-room/admin and musicEnabled)
+            try { mc.start(src, { force: false, vol }).catch(()=>{}); } catch(e){}
+            return;
+          }
+        } catch (e) {}
         const a = new Audio(src);
         a.loop = true;
         try { a.volume = vol; } catch(e){}
@@ -2192,10 +2205,28 @@ function playSound(name) {
             'maze-mini': 'bgm_maze_loop'
           };
           const key = bgmKeyMap[currentGameId] || 'bgm';
-          // ensure AudioContext unlocked before playing
+          // ensure AudioContext unlocked before background handling
           try { window.AUDIO.initOnFirstInteraction(); } catch(e){}
-          window.AUDIO.playBgm(key, { volume: 0.6 });
-          return;
+          // Always route BGM lifecycle through the centralized music controller when available.
+          // Controller will honor room/admin policy and the user's music toggle.
+          try {
+            const mc = window.__handNinja && window.__handNinja.musicController;
+            const bgmUrl = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : null;
+            if (mc && typeof mc.preload === 'function') {
+              // Preload only here; do not auto-play BGM from arbitrary playSound calls.
+              if (bgmUrl) mc.preload(bgmUrl).catch(()=>{});
+              return;
+            }
+          } catch (e) {
+            // fallthrough to AudioManager if controller check fails
+          }
+          // fallback to AudioManager if no centralized controller exists
+          try {
+            window.AUDIO.playBgm(key, { volume: 0.6 });
+            return;
+          } catch (e) {
+            // if AudioManager fails, fallthrough to legacy path
+          }
         } else {
           try { window.AUDIO.initOnFirstInteraction(); } catch(e){}
           // SFX: delegate to AudioManager; it will fallback gracefully
@@ -2215,67 +2246,28 @@ function playSound(name) {
     }
 
       if (name === 'bgm') {
-        // Delegate BGM handling to centralized musicController to ensure consistent behavior
+        // Do NOT auto-start BGM from arbitrary playSound calls.
+        // Route to musicController for preload only so playback is strictly gated to
+        // authoritative game start (startGame / NET.game_begin) or an explicit server force.
         try {
           const bgmUrl = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : 'https://ali-ezz.github.io/hand-traking-games/assets/bgm.mp3';
           const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
-          if (mc && typeof mc.start === 'function') {
-            // start will respect room/admin policy and the user's music preference
-            mc.start(bgmUrl, { force: false, vol: 0.6 });
+          if (mc && typeof mc.preload === 'function') {
+            // Preload for faster start later; do not call mc.start() here.
+            mc.preload(bgmUrl).catch(() => {});
             return;
           }
         } catch (e) {
-          console.warn('playSound delegated to musicController failed', e);
+          console.warn('playSound delegated to musicController (preload) failed', e);
         }
 
-        // Fallback older behavior if controller missing: only play when musicEnabled and not in-room non-admin
-        if (!musicEnabled) return;
-        const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-        if (roomsState && roomsState.room && !roomsState.isAdmin) {
-          // Non-admin clients must not auto-start BGM; preload only
-          try { if (ASSETS && ASSETS.bgm) { preloadSfx('bgm', ASSETS.bgm).catch(()=>{}); } } catch(e){}
-          return;
-        }
-
-        // fallback: attempt existing start strategies
+        // Legacy fallback: only preload or decode the BGM asset; do NOT autoplay here.
         try {
-          // stop previous audio
-          try { stopAllAudio(); } catch(e){}
           const url = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : null;
           if (!url) return;
-          // prefer decoded buffer
-          if (sfxBuffers && sfxBuffers['bgm']) {
-            try {
-              const ctx = ensureAudioCtx();
-              if (ctx) {
-                stopDecodedBgm();
-                const src = ctx.createBufferSource();
-                src.buffer = sfxBuffers['bgm'];
-                src.loop = true;
-                const g = ctx.createGain();
-                g.gain.value = 0.5;
-                src.connect(g);
-                g.connect(ctx.destination);
-                src.start(0);
-                decodedBgmNode = { source: src, gain: g, url };
-                decodedBgmPlaying = true;
-                return;
-              }
-            } catch(e){}
-          }
-          // SimpleAudio fallback
-          const sa = (window.__handNinja && window.__handNinja._simpleAudio) ? window.__handNinja._simpleAudio : null;
-          if (sa && sa.unlocked) {
-            try { sa.stopBgm(); sa.map.bgm = url; sa.playBgm('bgm', 0.6); return; } catch(e){}
-          }
-          // HTMLAudio fallback
-          try {
-            const inst = new Audio(url);
-            inst.loop = true;
-            inst.volume = 0.5;
-            inst.play().then(()=>{ bgmAudio = inst; soundPool.bgm = inst; }).catch(()=>{});
-          } catch(e){}
-        } catch(e){ console.warn('Legacy BGM fallback failed', e); }
+          // Attempt non-blocking decode into WebAudio for faster subsequent start.
+          try { decodeBgmBuffer(url).catch(()=>{}); } catch(e){}
+        } catch (e) { console.warn('Legacy BGM preload failed', e); }
         return;
       }
 
@@ -3056,10 +3048,10 @@ function playFatSound(soundName, options = {}) {
 }
 
 function setMusicEnabled(v) {
-  // Simplified centralized music toggle:
+  // Centralized music toggle:
   // - always persist preference
   // - disabling stops all audio immediately
-  // - enabling preloads when idle, starts immediately if a game is running
+  // - enabling preloads BGM and will START immediately for solo runs or when client is room admin.
   try {
     const prev = !!musicEnabled;
     musicEnabled = !!v;
@@ -3086,58 +3078,58 @@ function setMusicEnabled(v) {
     return;
   }
 
-  // Enabling: decide between immediate start (if running) or preload-only (if idle)
-  const mc = window.__handNinja && window.__handNinja.musicController ? window.__handNinja.musicController : null;
-  const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
-  const inRoom = !!(roomsState && roomsState.room);
-  const isAdmin = !!(roomsState && roomsState.isAdmin);
-
-  if (running) {
-    // If a game is actively running, start music now (respecting server/admin policy inside controller).
-    try {
-      if (mc && typeof mc.setRoomState === 'function') {
-        try { mc.setRoomState({ inRoom, isAdmin }); } catch (e) {}
-      }
-      if (mc && typeof mc.startGame === 'function') {
-        mc.startGame().catch(() => {});
-      } else {
-        // fallback: try decoded play or legacy playSound
-        try { ensureAudioCtx(); } catch (e) {}
-        if (ASSETS && ASSETS.bgm) {
-          decodeBgmBuffer(ASSETS.bgm).then(buf => {
-            try {
-              if (buf) {
-                playDecodedBgm(ASSETS.bgm, { vol: 0.8, loop: true });
-              } else {
-                playSound('bgm');
-              }
-            } catch (e) {}
-          }).catch(() => { try { playSound('bgm'); } catch (e) {} });
-        } else {
-          try { playSound('bgm'); } catch (e) {}
-        }
-      }
-      try { if (noticeEl) { noticeEl.textContent = 'Music enabled'; setTimeout(() => { noticeEl.textContent = ''; }, 1400); } } catch (e) {}
-    } catch (e) {
-      console.warn('Failed to start music on enable', e);
-    }
-    return;
-  }
-
-  // Not running: preload/decode BGM but do not auto-play
+  // Enabling: preload BGM and start immediately when allowed (solo or admin).
   try {
+    const mc = window.__handNinja && window.__handNinja.musicController;
+    const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
+    const inRoom = !!(roomsState && roomsState.room);
+    const isAdmin = !!(roomsState && roomsState.isAdmin);
+
     if (mc && typeof mc.setRoomState === 'function') {
       try { mc.setRoomState({ inRoom, isAdmin }); } catch (e) {}
     }
-    if (mc && typeof mc.preload === 'function') {
-      mc.preload(ASSETS && ASSETS.bgm).catch(() => {});
-    } else if (ASSETS && ASSETS.bgm) {
-      // best-effort decode into WebAudio without starting playback
-      decodeBgmBuffer(ASSETS.bgm).catch(() => {});
+
+    // Preload BGM asset to minimize first-play gap when a run actually starts.
+    let bgmUrl = (ASSETS && ASSETS.bgm) ? ASSETS.bgm : null;
+    try {
+      if (mc && typeof mc.preload === 'function') {
+        if (bgmUrl) mc.preload(bgmUrl).catch(()=>{});
+      } else if (bgmUrl) {
+        // best-effort decode into WebAudio without starting playback
+        decodeBgmBuffer(bgmUrl).catch(()=>{});
+      }
+    } catch (e) {
+      console.warn('Failed to preload BGM on enable', e);
     }
-    try { if (noticeEl) { noticeEl.textContent = 'Music enabled — will play when a game starts'; setTimeout(() => { noticeEl.textContent = ''; }, 1800); } } catch (e) {}
+
+    // If this is a solo run (not in room) or this client is the room admin,
+    // start playback immediately so the toggle acts as an on/off control.
+    try {
+      const allowedToAutoStart = !inRoom || isAdmin;
+      if (allowedToAutoStart && musicEnabled && bgmUrl) {
+        if (mc && typeof mc.start === 'function') {
+          try { mc.start(bgmUrl, { force: false, vol: (mc.getState && mc.getState().vol) ? mc.getState().vol : 0.7 }).catch(()=>{}); } catch(e){}
+        } else {
+          // Legacy fallback: attempt decoded start then HTMLAudio/playSound
+          (async () => {
+            try {
+              const ok = await decodeBgmBuffer(bgmUrl).catch(()=>null);
+              if (ok && decodedBgm && decodedBgmUrl === bgmUrl) {
+                try { playDecodedBgm(bgmUrl, { vol: 0.8, loop: true }); return; } catch(e){}
+              }
+            } catch(e){}
+            try { playSound('bgm'); } catch(e){}
+          })();
+        }
+        try { if (noticeEl) { noticeEl.textContent = 'Music enabled — playing'; setTimeout(() => { noticeEl.textContent = ''; }, 1400); } } catch(e){}
+      } else {
+        try { if (noticeEl) { noticeEl.textContent = 'Music enabled — will play when a game starts or admin forces it'; setTimeout(() => { noticeEl.textContent = ''; }, 1600); } } catch(e){}
+      }
+    } catch (e) {
+      console.warn('Failed to auto-start BGM on enable', e);
+    }
   } catch (e) {
-    console.warn('Failed to preload BGM on enable', e);
+    console.warn('setMusicEnabled inner exception', e);
   }
 }
 
@@ -6862,6 +6854,7 @@ if (assetsBtn && assetsPanel) {
 
  // sync music initial state and ensure proper game-specific BGM switching
 syncMusicCheckboxes(musicEnabled);
+setMusicEnabled(musicEnabled);
 
 // Keep musicController room state in sync with ROOMS_UI changes (so admin/in-room policy is up-to-date)
 try {
@@ -7293,6 +7286,13 @@ if (window.NET) {
             if (sel) sel.value = data.game;
             // Make the server's game selection authoritative locally so subsequent logic uses it
             try { currentGameId = data.game; } catch (e) { /* ignore if not writable */ }
+
+            // Ensure clients update their BGM mapping and PRELOAD the admin-selected BGM.
+            // Do NOT force local autoplay here; the centralized musicController or subsequent
+            // authoritative game_begin/music_play events decide when to actually start playback.
+            try {
+              if (typeof updateGameBGM === 'function') updateGameBGM(data.game, { force: false });
+            } catch (e) { /* non-fatal: continue even if updateGameBGM isn't available */ }
           }
           if (data && typeof data.timeLimit === 'number') {
             const gl = document.getElementById('gameLength');
@@ -7563,11 +7563,19 @@ if (window.NET) {
                       } catch(e){}
                     }
                     try {
-                      if (ASSETS && ASSETS.bgm) {
-                        playSound('bgm');
-                        console.log('Fallback game music started (legacy) on game_begin');
+                      if (forcePlayAll) {
+                        if (ASSETS && ASSETS.bgm) {
+                          playSound('bgm');
+                          console.log('Fallback game music started (legacy) on game_begin (forcePlayAll)');
+                        }
+                      } else {
+                        if (ASSETS && ASSETS.bgm) {
+                          // Preload only; do not autoplay for non-forced starts
+                          try { decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e) {}
+                          console.log('Fallback: preloaded BGM (legacy) on game_begin (not auto-starting)');
+                        }
                       }
-                    } catch (e) { try { playSound('bgm'); } catch (e2) {} }
+                    } catch (e) { try { if (forcePlayAll) playSound('bgm'); } catch (e2) {} }
                   } else {
                     if (url) _preloadWithTimeout(url, 1800).catch(()=>{});
                     console.log('Fallback: preloaded BGM (not auto-starting) on game_begin');
@@ -7702,18 +7710,22 @@ if (window.NET) {
         const mc = window.__handNinja && window.__handNinja.musicController;
 
         // Prefer the centralized music controller when available
-        if (mc && typeof mc.startGame === 'function') {
+        if (mc && typeof mc.start === 'function') {
+          const bgmUrl = (data && data.bgmUrl) ? data.bgmUrl : (ASSETS && ASSETS.bgm);
+          // Ensure controller knows current room/admin state
+          try { mc.setRoomState({ inRoom: !!(window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.room), isAdmin: !!(window.ROOMS_UI && window.ROOMS_UI.state && window.ROOMS_UI.state.isAdmin) }); } catch(e){}
+
           if (forcePlayAll) {
-            mc.startGame();
+            try { mc.start(bgmUrl, { force: true, vol: 0.8 }).catch(()=>{}); } catch(e){}
           } else {
             // Only auto-start when allowed: either not in a room, or user is admin, and user has music enabled.
             const roomsState = (window.ROOMS_UI && window.ROOMS_UI.state) ? window.ROOMS_UI.state : null;
             const allowed = !(roomsState && roomsState.room) || (roomsState && roomsState.isAdmin);
             if (musicEnabled && allowed) {
-              mc.startGame();
+              try { mc.start(bgmUrl, { force: false, vol: 0.8 }).catch(()=>{}); } catch(e){}
             } else {
               // Preload/decode for faster start if user later enables/admits playback
-              try { if (ASSETS && ASSETS.bgm) decodeBgmBuffer(ASSETS.bgm).catch(()=>{}); } catch(e){}
+              try { if (bgmUrl) decodeBgmBuffer(bgmUrl).catch(()=>{}); } catch(e){}
             }
           }
           return;
