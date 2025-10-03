@@ -535,29 +535,35 @@ function cleanupAfterLeave() {
 let serverStartEpoch = null;  // epoch ms when the server-authoritative game started
 let serverAuthoritative = false; // true when server-driven spawns are active
 
- // Physics & spawn tuning (slower & fewer)
- // Tuned to reduce object density on-screen and make bombs rarer on lower-end devices.
+ // Physics & spawn tuning (difficulty-tuned for ninja-fruit)
+ // GRAVITY remains robust for visceral arcs; other numbers tuned to increase challenge.
  const GRAVITY = 1200; // px/s^2
- // Increase spawn interval to reduce per-second object rate (less clutter)
- const FRUIT_SPAWN_INTERVAL = 2200; // ms (longer -> fewer)
- // Make bombs significantly rarer to avoid frequent penalties
- const BOMB_SPAWN_INTERVAL = 9000; // ms (very rare)
-  // Lower concurrent caps so fewer objects are visible at once
-  const MAX_FRUITS = 3;
-  // Increased bomb concurrency to make bombs more visible in both single-player and multiplayer.
-  // Tweak MAX_BOMBS to control solo counts; the multiplayer cap is computed by applying SERVER_SPAWN_MULTIPLIER.
-  const MAX_BOMBS = 4;
-  // When running in server-authoritative (multiplayer) mode, scale down spawn caps by this multiplier.
-  // Reduce multiplier so multiplayer shows noticeably fewer objects (helps crowded rooms).
-  // Set to 0.5 to roughly half client-side density for authoritative runs.
-  const SERVER_SPAWN_MULTIPLIER = 0.5;
-  const HIT_PADDING = 24;
+
+ // Make the fruit spawn more aggressive so multiple objects appear simultaneously.
+ // Shorter interval -> higher on-screen density and more overlapping slices required.
+ const FRUIT_SPAWN_INTERVAL = 900; // ms (shorter -> more frequent)
+
+ // Increase bomb frequency to raise difficulty (still bounded by MAX_BOMBS).
+ const BOMB_SPAWN_INTERVAL = 4500; // ms
+
+ // Allow more concurrent fruits so the screen can feel busy and challenging.
+ const MAX_FRUITS = 8;
+
+ // Slightly higher bomb concurrency to make bombs a real threat in crowded scenes.
+ const MAX_BOMBS = 6;
+
+ // When running in server-authoritative (multiplayer) mode, scale down spawn caps by this multiplier.
+ // Keep it less aggressive than solo but allow substantial density in authoritative runs.
+ const SERVER_SPAWN_MULTIPLIER = 0.75;
+
+ const HIT_PADDING = 24;
 
 let lastFruitSpawn = 0;
 let lastBombSpawn = 0;
 
 const objects = []; // fruits and bombs
 const particles = [];
+const slices = []; // sliced fruit halves for simple slice animation
 
 // Global caps and cooldowns to limit transient objects and audio thrash
 const MAX_PARTICLES = 200;
@@ -667,11 +673,33 @@ const runnerControlModule = (function(){
   function rand(a,b){ return a + Math.random()*(b-a); }
   function randInt(a,b){ return Math.floor(rand(a,b+1)); }
 
-  function resetRunner(){
+    function resetRunner(){
     const width = canvas.width / DPR;
     const height = canvas.height / DPR;
     // No lives: runner-play is time-limited only. Score stored globally.
-    avatar = { x: Math.max(80, width*0.18), y: height*0.5, vy:0, r:16, speed: 180, stamina: 1.0 };
+    // Add prevY so we can render a subtle motion trail for the avatar.
+    // Jet fields added: jetOn, jetTimer and jetStrength to drive a simple jet flame visual.
+    avatar = {
+      x: Math.max(80, width * 0.18),
+      y: height * 0.5,
+      vy: 0,
+      r: 16,
+      speed: 180,
+      stamina: 1.0,
+      prevY: height * 0.5,
+      headOffset: 0,
+      // jetpack support
+      hasJet: true,
+      // When true the jet is a fixed-attached object to the avatar and continuously fires.
+      // This implements the user's request for a jet object that is always attached and firing
+      // rather than triggering only on movement/pinch.
+      jetAlwaysOn: true,
+      jetOn: false,
+      jetTimer: 0,
+      jetStrength: 220,
+      // jet direction for visual flame: 'up' | 'down'
+      jetDir: 'up'
+    };
     obstacles = [];
     lastSpawn = performance.now();
     runningModule = true;
@@ -708,7 +736,7 @@ const runnerControlModule = (function(){
     obstacles.push({ id: Math.random().toString(36).slice(2,9), x: spawnX, y, h, gap, w: 32, speed, passed:false });
   }
 
-  function updateRunner(dt, hands){
+    function updateRunner(dt, hands){
     if (!runningModule) return;
     // stop updating when global run state ended
     if (!running) { runningModule = false; return; }
@@ -721,6 +749,8 @@ const runnerControlModule = (function(){
     const tip = (hands && hands.length === 1 && hands[0] && hands[0][8]) ? hands[0][8] : null;
     if (tip) {
       const targetY = tip.y;
+      // store previous Y for trailing visuals
+      avatar.prevY = avatar.y;
       // compute desired velocity to move toward fingertip (tunable responsiveness)
       const desiredVy = (targetY - avatar.y) * 8; // higher = more responsive
       // lerp factor for velocity smoothing (frame-rate independent)
@@ -731,24 +761,60 @@ const runnerControlModule = (function(){
       // integrate position
       avatar.y += avatar.vy * dt;
 
+      // head follow: smoothly track fingertip relative to avatar to drive small head movement
+      try {
+        const desiredHead = Math.max(-20, Math.min(20, (targetY - avatar.y) * 0.25));
+        const headBlend = Math.min(1, 12 * dt);
+        avatar.headOffset = (typeof avatar.headOffset === 'number') ? avatar.headOffset + (desiredHead - avatar.headOffset) * headBlend : desiredHead;
+      } catch(e){}
+
       // compute fingertip velocity for poke detection (unchanged measurement)
       if (!updateRunner._lastTipY) updateRunner._lastTipY = targetY;
       const vyTip = (targetY - updateRunner._lastTipY) / Math.max(0.001, dt);
       updateRunner._lastTipY = targetY;
 
-      // quick downward poke (hand moving quickly downward) => give a smooth upward impulse
-      // Remove particle and jump sound to satisfy "no jump particles or sound" requirement.
-      if (vyTip > 300) {
-        // apply an upward velocity impulse (clamped) for a responsive pop without visual/sound noise
-        const impulse = Math.min(220, vyTip * 0.02);
-        // set a negative vy to move avatar upward smoothly
-        avatar.vy = Math.min(avatar.vy, -impulse);
-      }
+      // Jetpack visual-only behavior (inside fingertip branch):
+      // When the jet is attached we enable the visual flame here but do NOT apply any physics/thrust.
+      // Thrust was removed to make the jet purely cosmetic and always-on when requested.
+      try {
+        if (avatar.hasJet && avatar.jetAlwaysOn) {
+          avatar.jetOn = true;
+          avatar.jetDir = 'up';
+        } else {
+          // Preserve any externally-driven jet state when not configured as always-on.
+          avatar.jetOn = !!avatar.jetOn;
+        }
+      } catch (e) {}
+    } else {
+      // decay head offset toward neutral when no fingertip present
+      try {
+        const decayBlend = Math.min(1, 6 * dt);
+        avatar.headOffset = (typeof avatar.headOffset === 'number') ? avatar.headOffset * (1 - decayBlend) : 0;
+      } catch(e){}
     }
 
-    // clamp
+      // Ensure attached jet visual persists independently of fingertip presence when jetAlwaysOn is enabled.
+      // This makes the jet an object visually attached to the avatar and continuously firing as requested,
+      // without applying any upward force to the avatar's physics.
+      try {
+        if (avatar && avatar.hasJet && avatar.jetAlwaysOn) {
+          avatar.jetOn = true;
+          avatar.jetDir = 'up';
+          // clear any short-lived timers so the jet remains on continuously
+          avatar.jetTimer = 0;
+        }
+      } catch (e) {}
+
+      // clamp
     if (avatar.y < 20) { avatar.y = 20; avatar.vy = 0; }
     if (avatar.y > height - 20) { avatar.y = height - 20; avatar.vy = 0; }
+
+    // update jet timer: automatically turn jet off when timer expires
+    try {
+      if (avatar && avatar.jetOn && avatar.jetTimer) {
+        if ((performance.now ? performance.now() : Date.now()) > avatar.jetTimer) avatar.jetOn = false;
+      }
+    } catch (e) {}
 
     // spawn obstacles
     const now = performance.now();
@@ -799,21 +865,242 @@ const runnerControlModule = (function(){
     const width = canvas.width / DPR;
     const height = canvas.height / DPR;
     ctx.save();
-    // keep video visible as background so the user can see themself (do not paint over)
-    // avatar
-    ctx.beginPath();
-    ctx.fillStyle = 'orange';
-    ctx.arc(avatar.x, avatar.y, avatar.r, 0, Math.PI*2);
-    ctx.fill();
-    // HUD is handled by the global UI (scoreEl) — no per-avatar score box here.
-    // obstacles
+
+    // subtle ground shadow to anchor the scene
+    try {
+      ctx.fillStyle = 'rgba(0,0,0,0.10)';
+      ctx.beginPath();
+      ctx.ellipse(width*0.5, height - 18, width*0.48, 24, 0, 0, Math.PI*2);
+      ctx.fill();
+    } catch(e){}
+
+    // Draw obstacles as stylized pipes (Flappy-style)
     for (const o of obstacles) {
-      ctx.fillStyle = '#444';
-      ctx.fillRect(o.x, 0, o.w, o.y + o.h);
-      ctx.fillRect(o.x, o.y + o.gap, o.w, height - (o.y + o.gap));
-      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-      ctx.strokeRect(o.x, o.y, o.w, o.h);
+      try {
+        const pipeW = o.w || 32;
+        const gapTop = o.y + o.h;
+        const gapBottom = o.y + o.gap;
+
+        // top pipe (from top to gapTop)
+        const topH = Math.max(24, gapTop);
+        const gradTop = ctx.createLinearGradient(o.x, 0, o.x + pipeW, 0);
+        gradTop.addColorStop(0, '#2e8b2e');
+        gradTop.addColorStop(1, '#1f6a1f');
+
+        ctx.save();
+        ctx.fillStyle = gradTop;
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 2;
+        // rounded cap for top pipe
+        ctx.beginPath();
+        ctx.moveTo(o.x, 0);
+        ctx.lineTo(o.x + pipeW, 0);
+        ctx.lineTo(o.x + pipeW, topH - 10);
+        ctx.quadraticCurveTo(o.x + pipeW*0.5, topH + 8, o.x, topH - 10);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        // bottom pipe (from gapBottom to bottom)
+        const bottomH = Math.max(24, (height - gapBottom));
+        const gradBot = ctx.createLinearGradient(o.x, 0, o.x + pipeW, 0);
+        gradBot.addColorStop(0, '#2aa02a');
+        gradBot.addColorStop(1, '#158915');
+
+        ctx.beginPath();
+        ctx.moveTo(o.x, gapBottom + 10);
+        ctx.quadraticCurveTo(o.x + pipeW*0.5, gapBottom - 8, o.x + pipeW, gapBottom + 10);
+        ctx.lineTo(o.x + pipeW, height);
+        ctx.lineTo(o.x, height);
+        ctx.closePath();
+        ctx.fillStyle = gradBot;
+        ctx.fill();
+        ctx.stroke();
+
+        // subtle inner highlight on top edge
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+        ctx.lineWidth = 1;
+        ctx.moveTo(o.x + 4, 6);
+        ctx.lineTo(o.x + pipeW - 4, 6);
+        ctx.stroke();
+        ctx.restore();
+      } catch(e){}
     }
+
+    // Avatar: stylized bird-ish/flappy avatar with wing bob and eye.
+    try {
+      ctx.save();
+      const bob = Math.sin((performance.now()||0) * 0.01 + (avatar.y * 0.02)) * 3;
+      const ax = avatar.x;
+      // apply a modest head offset driven by avatar.headOffset (set from fingertip); scaled so motion is subtle
+      const ay = avatar.y + bob + (typeof avatar.headOffset === 'number' ? avatar.headOffset * 0.6 : 0);
+      const ar = Math.max(10, avatar.r);
+
+      // subtle motion trail behind the avatar using previous frame Y
+      try {
+        const prev = (typeof avatar.prevY === 'number') ? avatar.prevY : avatar.y;
+        const dy = ay - prev;
+        const trailAlpha = Math.min(0.28, Math.abs(dy) * 0.012);
+        if (trailAlpha > 0.01) {
+          ctx.beginPath();
+          ctx.fillStyle = `rgba(255,140,60,${trailAlpha})`;
+          ctx.ellipse(ax - Math.sign(dy) * ar * 0.3, ay - dy * 0.18, ar * 1.1, Math.max(6, Math.abs(dy) * 0.8), 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } catch(e){}
+
+      // drop shadow
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(0,0,0,0.12)';
+      ctx.ellipse(ax, ay + ar + 6, ar * 1.05, ar * 0.5, 0, 0, Math.PI*2);
+      ctx.fill();
+
+      // jet flame (visual-only) — attach to avatar's back and animate flicker under the jet/back
+      if (avatar && avatar.jetOn) {
+        try {
+          ctx.save();
+
+          // time-based flicker to animate flame shape & size
+          const _now = (performance && performance.now) ? performance.now() : Date.now();
+          const t = (_now * 0.001);
+
+          // flame dimensions (animated, more pronounced flicker)
+          const flameH = ar * (0.9 + 0.38 * Math.abs(Math.sin(t * 6.8)));
+          const flameW = ar * (0.5 + 0.28 * Math.abs(Math.cos(t * 5.1)));
+
+          // Anchor flame to the avatar's back so it sits under the jet pack
+          // Back offset oscillates slightly so the flame feels attached to the body motion.
+          const backOffsetX = ar * (0.9 + 0.08 * Math.cos(t * 3.7));
+          const fx = ax - backOffsetX;
+          const fy = ay + (ar * 0.36) + Math.sin(t * 9.3) * (ar * 0.05) + (avatar.headOffset ? avatar.headOffset * 0.08 : 0);
+
+          // radial gradient from hot core outward
+          const fg = ctx.createRadialGradient(fx, fy, 0, fx, fy - flameH * 0.28, flameW);
+          fg.addColorStop(0, 'rgba(255,250,200,0.99)');
+          fg.addColorStop(0.25, 'rgba(255,210,100,0.95)');
+          fg.addColorStop(0.6, 'rgba(255,120,50,0.88)');
+          fg.addColorStop(1, 'rgba(255,60,6,0.0)');
+
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.fillStyle = fg;
+
+          // slightly rotate ellipse to suggest exhaust angle away from body and add subtle wobble
+          const rot = -0.35 + Math.sin(t * 4.2) * 0.06;
+          ctx.beginPath();
+          ctx.ellipse(fx, fy, flameW * 1.05, flameH * 1.25, rot, 0, Math.PI * 2);
+          ctx.fill();
+
+          // inner bright core
+          try {
+            const coreG = ctx.createRadialGradient(fx, fy - flameH * 0.12, 0, fx, fy - flameH * 0.12, flameW * 0.45);
+            coreG.addColorStop(0, 'rgba(255,245,180,0.99)');
+            coreG.addColorStop(0.6, 'rgba(255,170,60,0.9)');
+            coreG.addColorStop(1, 'rgba(255,60,10,0.0)');
+            ctx.fillStyle = coreG;
+            ctx.beginPath();
+            ctx.ellipse(fx, fy - flameH * 0.12, flameW * 0.48, flameH * 0.48, rot * 0.8, 0, Math.PI * 2);
+            ctx.fill();
+          } catch (innerE) {}
+
+          ctx.restore();
+        } catch (e) {}
+      }
+
+      // body gradient
+      const g = ctx.createLinearGradient(ax - ar, ay - ar, ax + ar, ay + ar);
+      g.addColorStop(0, '#ffcc66');
+      g.addColorStop(0.6, '#ff9f3c');
+      g.addColorStop(1, '#ff7b2a');
+      ctx.beginPath();
+      ctx.fillStyle = g;
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+      ctx.lineWidth = 2;
+      ctx.arc(ax, ay, ar, 0, Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+
+      // draw a compact jet-pack on the avatar's back (drawn after body so it visually sits on the back)
+      try {
+        ctx.save();
+        // pack size relative to avatar radius
+        const packW = ar * 0.9;
+        const packH = ar * 0.78;
+        // position pack on the left-back of the avatar (assuming avatar faces right)
+        const packX = ax - ar * 0.62 + (Math.sin((performance && performance.now ? performance.now() : Date.now()) * 0.004) * (ar * 0.02));
+        const packY = ay - ar * 0.22 + (avatar.headOffset ? avatar.headOffset * 0.06 : 0);
+
+        ctx.translate(packX, packY);
+        ctx.rotate(-0.18);
+
+        // pack body (rounded rect)
+        const radius = Math.max(4, ar * 0.12);
+        ctx.beginPath();
+        ctx.moveTo(-packW/2 + radius, -packH/2);
+        ctx.lineTo(packW/2 - radius, -packH/2);
+        ctx.quadraticCurveTo(packW/2, -packH/2, packW/2, -packH/2 + radius);
+        ctx.lineTo(packW/2, packH/2 - radius);
+        ctx.quadraticCurveTo(packW/2, packH/2, packW/2 - radius, packH/2);
+        ctx.lineTo(-packW/2 + radius, packH/2);
+        ctx.quadraticCurveTo(-packW/2, packH/2, -packW/2, packH/2 - radius);
+        ctx.lineTo(-packW/2, -packH/2 + radius);
+        ctx.quadraticCurveTo(-packW/2, -packH/2, -packW/2 + radius, -packH/2);
+        ctx.closePath();
+
+        const pg = ctx.createLinearGradient(-packW/2, -packH/2, packW/2, packH/2);
+        pg.addColorStop(0, '#2b2b2b');
+        pg.addColorStop(1, '#141414');
+        ctx.fillStyle = pg;
+        ctx.fill();
+
+        // metallic accent stroke
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+        ctx.stroke();
+
+        // small nozzle on lower-left of pack (so flame reads as beneath it)
+        try {
+          ctx.beginPath();
+          ctx.fillStyle = '#0e0e0e';
+          ctx.ellipse(-packW/2 - 2, packH * 0.08, packW * 0.18, packH * 0.12, 0, 0, Math.PI * 2);
+          ctx.fill();
+
+          // subtle inner highlight on nozzle
+          ctx.beginPath();
+          ctx.fillStyle = 'rgba(255,200,120,0.06)';
+          ctx.ellipse(-packW/2 - 1.5, packH * 0.08, packW * 0.06, packH * 0.04, 0, 0, Math.PI * 2);
+          ctx.fill();
+        } catch (innerNozzleE) {}
+
+        ctx.restore();
+      } catch (e) { /* drawing pack is non-fatal */ }
+
+      // wing (animated)
+      ctx.save();
+      const wingTilt = Math.sin((performance.now()||0) * 0.014 + avatar.x * 0.002) * 0.6;
+      ctx.translate(ax, ay);
+      ctx.rotate(wingTilt * 0.15);
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(255,140,60,0.95)';
+      ctx.moveTo(-ar*0.2, 0);
+      ctx.quadraticCurveTo(ar*0.8, -ar*0.4, ar*0.2, -ar*0.7);
+      ctx.quadraticCurveTo(-ar*0.3, -ar*0.2, -ar*0.2, 0);
+      ctx.fill();
+      ctx.restore();
+
+      // eye
+      ctx.beginPath();
+      ctx.fillStyle = '#222';
+      ctx.arc(ax + ar*0.35, ay - ar*0.18, Math.max(1.8, ar*0.18), 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.fillStyle = 'white';
+      ctx.arc(ax + ar*0.4, ay - ar*0.22, Math.max(0.6, ar*0.06), 0, Math.PI*2);
+      ctx.fill();
+
+      ctx.restore();
+    } catch(e){}
+
     ctx.restore();
   }
 
@@ -1125,67 +1412,179 @@ const useLogical = (window.__handNinja && typeof window.__handNinja.forceLogical
     if (!ctx || !cells) return;
     const width = canvas.width / DPR, height = canvas.height / DPR;
     ctx.save();
-    // semi-opaque panel behind maze for clarity (use computed maze origin so panel and maze align)
+    // compute bounds
     const mazeW = cols * cellSize, mazeH = rows * cellSize;
     const ox = mazeOx || Math.floor((width - mazeW) / 2);
     const oy = mazeOy || Math.floor((height - mazeH) / 2);
     const pad = 12;
-    ctx.fillStyle = 'rgba(0,0,0,0.38)';
-    ctx.fillRect(ox - Math.floor(pad/2), oy - Math.floor(pad/2), Math.min(width - pad, mazeW + pad), Math.min(height - pad, mazeH + pad));
- 
-    // translate to maze origin (center it roughly) - ox/oy already set above
 
-    // draw grid walls
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-    ctx.lineWidth = 2;
-    for (let cy = 0; cy < rows; cy++) {
-      for (let cx = 0; cx < cols; cx++) {
-        const cell = cells[idx(cx,cy)];
-        const x0 = ox + cx * cellSize, y0 = oy + cy * cellSize;
-        // top
-        if (cell.walls[0]) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + cellSize, y0); ctx.stroke(); }
-        // right
-        if (cell.walls[1]) { ctx.beginPath(); ctx.moveTo(x0 + cellSize, y0); ctx.lineTo(x0 + cellSize, y0 + cellSize); ctx.stroke(); }
-        // bottom
-        if (cell.walls[2]) { ctx.beginPath(); ctx.moveTo(x0, y0 + cellSize); ctx.lineTo(x0 + cellSize, y0 + cellSize); ctx.stroke(); }
-        // left
-        if (cell.walls[3]) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + cellSize); ctx.stroke(); }
-      }
-    }
-
-    // highlight exit cells
-    if (exitCells && exitCells.length) {
-      ctx.fillStyle = 'rgba(255,200,60,0.95)';
-      for (const exCell of exitCells) {
-        const ex = ox + exCell.cx * cellSize, ey = oy + exCell.cy * cellSize;
-        ctx.fillRect(ex + 4, ey + 4, cellSize - 8, cellSize - 8);
-      }
-    }
-
-    // draw player
-    if (player) {
-      const px = ox + (player.x), py = oy + (player.y);
+    // rounded panel behind maze
+    try {
+      ctx.save();
+      ctx.fillStyle = 'rgba(8,12,18,0.66)';
+      const rx = 12;
+      const x = ox - Math.floor(pad/2), y = oy - Math.floor(pad/2), w = Math.min(width - pad, mazeW + pad), h = Math.min(height - pad, mazeH + pad);
       ctx.beginPath();
-      ctx.fillStyle = 'cyan';
-      ctx.arc(ox + player.x, oy + player.y, Math.max(8, cellSize * 0.18), 0, Math.PI*2);
+      ctx.moveTo(x + rx, y);
+      ctx.lineTo(x + w - rx, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + rx);
+      ctx.lineTo(x + w, y + h - rx);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - rx, y + h);
+      ctx.lineTo(x + rx, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - rx);
+      ctx.lineTo(x, y + rx);
+      ctx.quadraticCurveTo(x, y, x + rx, y);
+      ctx.closePath();
       ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      // small target ring
-      ctx.beginPath();
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = 'rgba(0,200,255,0.9)';
-      ctx.arc(ox + player.targetX, oy + player.targetY, Math.max(6, cellSize * 0.12), 0, Math.PI*2);
-      ctx.stroke();
+
+      // soft vignette for contrast
+      ctx.fillStyle = 'rgba(0,0,0,0.12)';
+      ctx.fillRect(x, y + h - 18, w, 18);
+      ctx.restore();
+    } catch(e){}
+
+    // draw cell backgrounds with subtle alternating tint
+    try {
+      for (let cy = 0; cy < rows; cy++) {
+        for (let cx = 0; cx < cols; cx++) {
+          const x0 = ox + cx * cellSize, y0 = oy + cy * cellSize;
+          const alt = ((cx + cy) % 2) === 0;
+          ctx.fillStyle = alt ? 'rgba(18,22,28,0.18)' : 'rgba(18,22,28,0.12)';
+          ctx.fillRect(x0 + 1, y0 + 1, cellSize - 2, cellSize - 2);
+        }
+      }
+    } catch(e){}
+
+    // draw walls as thick polished strokes with subtle shadow
+    try {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let cy = 0; cy < rows; cy++) {
+        for (let cx = 0; cx < cols; cx++) {
+          const cell = cells[idx(cx,cy)];
+          const x0 = ox + cx * cellSize, y0 = oy + cy * cellSize;
+          // top
+          if (cell.walls[0]) { 
+            ctx.beginPath(); 
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+            ctx.lineWidth = Math.max(2, Math.min(4, cellSize * 0.06));
+            ctx.moveTo(x0+1, y0+1); ctx.lineTo(x0 + cellSize -1, y0+1); ctx.stroke(); 
+            // inner shadow
+            ctx.beginPath(); ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1; ctx.moveTo(x0+2, y0+3); ctx.lineTo(x0 + cellSize -2, y0+3); ctx.stroke();
+          }
+          // right
+          if (cell.walls[1]) { 
+            ctx.beginPath(); 
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)'; 
+            ctx.lineWidth = Math.max(2, Math.min(4, cellSize * 0.06));
+            ctx.moveTo(x0 + cellSize -1, y0+1); ctx.lineTo(x0 + cellSize -1, y0 + cellSize -1); ctx.stroke(); 
+            ctx.beginPath(); ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = 1; ctx.moveTo(x0 + cellSize -3, y0+3); ctx.lineTo(x0 + cellSize -3, y0 + cellSize -3); ctx.stroke();
+          }
+          // bottom
+          if (cell.walls[2]) { 
+            ctx.beginPath(); 
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)'; 
+            ctx.lineWidth = Math.max(2, Math.min(4, cellSize * 0.06));
+            ctx.moveTo(x0+1, y0 + cellSize -1); ctx.lineTo(x0 + cellSize -1, y0 + cellSize -1); ctx.stroke(); 
+            ctx.beginPath(); ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = 1; ctx.moveTo(x0+2, y0 + cellSize -3); ctx.lineTo(x0 + cellSize -2, y0 + cellSize -3); ctx.stroke();
+          }
+          // left
+          if (cell.walls[3]) { 
+            ctx.beginPath(); 
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)'; 
+            ctx.lineWidth = Math.max(2, Math.min(4, cellSize * 0.06));
+            ctx.moveTo(x0+1, y0+1); ctx.lineTo(x0+1, y0 + cellSize -1); ctx.stroke(); 
+            ctx.beginPath(); ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = 1; ctx.moveTo(x0+3, y0+3); ctx.lineTo(x0+3, y0 + cellSize -3); ctx.stroke();
+          }
+        }
+      }
+    } catch(e){}
+
+    // highlight exit cells with a glowing plate (pulsing halo)
+    if (exitCells && exitCells.length) {
+      for (const exCell of exitCells) {
+        try {
+          const ex = ox + exCell.cx * cellSize, ey = oy + exCell.cy * cellSize;
+          ctx.save();
+          const pulse = 1 + Math.sin((performance.now()||0) * 0.008) * 0.18;
+          ctx.shadowColor = 'rgba(255,210,90,0.95)';
+          ctx.shadowBlur = 18 * pulse;
+          ctx.fillStyle = `rgba(255,210,90,${0.95 * Math.min(1, pulse)})`;
+          drawRoundedRect(ctx, ex + 6 - (cellSize*0.04)*(pulse-1), ey + 6 - (cellSize*0.04)*(pulse-1), (cellSize - 12) * (1 + (pulse-1)*0.06), (cellSize - 12) * (1 + (pulse-1)*0.06), 6 + Math.floor(pulse));
+          ctx.fill();
+          // outer glow ring
+          ctx.beginPath();
+          ctx.strokeStyle = `rgba(255,210,90,${0.35 * pulse})`;
+          ctx.lineWidth = 6 * pulse;
+          ctx.arc(ex + cellSize/2, ey + cellSize/2, (cellSize - 6) * 0.5 * (1 + (pulse-1)*0.12), 0, Math.PI*2);
+          ctx.stroke();
+          ctx.restore();
+        } catch(e){}
+      }
+    }
+
+    // draw player as polished orb with small target ring
+    if (player) {
+      try {
+        const px = ox + player.x, py = oy + player.y;
+        ctx.save();
+        // shadow
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(0,0,0,0.18)';
+        ctx.ellipse(px, py + 8, Math.max(6, cellSize*0.16), 6, 0, 0, Math.PI*2);
+        ctx.fill();
+
+        // orb
+        const rg = ctx.createRadialGradient(px - 6, py - 6, Math.max(2, cellSize*0.02), px, py, Math.max(6, cellSize*0.24));
+        rg.addColorStop(0, 'rgba(80,230,255,0.95)');
+        rg.addColorStop(0.6, 'rgba(40,200,230,0.95)');
+        rg.addColorStop(1, 'rgba(16,120,180,0.9)');
+        ctx.beginPath();
+        ctx.fillStyle = rg;
+        ctx.arc(px, py, Math.max(8, cellSize * 0.18), 0, Math.PI*2);
+        ctx.fill();
+
+        // subtle ring
+        ctx.beginPath();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+        ctx.stroke();
+
+        // target ring glow
+        ctx.beginPath();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(0,220,255,0.9)';
+        ctx.setLineDash([6,6]);
+        ctx.arc(ox + player.targetX, oy + player.targetY, Math.max(6, cellSize * 0.12), 0, Math.PI*2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+      } catch(e){}
     }
 
     // HUD label
-    ctx.fillStyle = 'white';
-    ctx.font = '14px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Maze — move your index finger to navigate to the highlighted exit', width/2, oy - 8);
+    try {
+      ctx.fillStyle = 'white';
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Maze — move your index finger to navigate to the highlighted exit', width/2, oy - 10);
+    } catch(e){}
+
     ctx.restore();
+
+    // small helper: rounded rect draw (local to function)
+    function drawRoundedRect(ctx, x, y, w, h, r) {
+      try {
+        const radius = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.arcTo(x + w, y, x + w, y + h, radius);
+        ctx.arcTo(x + w, y + h, x, y + h, radius);
+        ctx.arcTo(x, y + h, x, y, radius);
+        ctx.arcTo(x, y, x + w, y, radius);
+        ctx.closePath();
+      } catch(e){}
+    }
   }
 
   function initModule(){
@@ -3199,12 +3598,12 @@ function generateGameItems(gameType, seed) {
 
     for (let i = 0; i < numItems; i++) {
       // In multiplayer fallbacks make bombs rarer
-      let isBomb = (localRand() > 0.82);
+      // make bombs more common to increase difficulty (solo baseline increased to ~36% bombs)
+      let isBomb = (localRand() > 0.64);
       try {
         if (typeof serverAuthoritative !== 'undefined' && serverAuthoritative) {
-          // reduce bomb frequency for multiplayer fallback (rarer than solo)
-          // make bombs even rarer in multiplayer fallbacks to reduce negative UX (approx ~6-8%)
-          isBomb = (localRand() > 0.94);
+          // in multiplayer fallback still somewhat rarer than solo but not too sparse (~20%)
+          isBomb = (localRand() > 0.80);
         }
       } catch (e) { /* ignore */ }
 
@@ -3575,20 +3974,20 @@ function generateRandomShape() {
 
 // spawn fruit and bomb
  function spawnFruit(opts) {
-   opts = opts || {};
-   // Reduce local spawn caps when running in server-authoritative (multiplayer) mode.
-   // If forceLocal is set, treat this spawn as a local fallback and use normal local caps.
-   const effectiveMax = (serverAuthoritative && !opts.forceLocal)
-     // In multiplayer reduce visible fruits but keep at least two when base cap > 0 to avoid starvation.
-     ? Math.max((MAX_FRUITS > 0 ? 2 : 0), Math.floor(MAX_FRUITS * SERVER_SPAWN_MULTIPLIER))
-     : MAX_FRUITS;
-   if ((objects.filter(o => o.type === 'fruit').length) >= effectiveMax) return;
+  opts = opts || {};
+  // Reduce local spawn caps when running in server-authoritative (multiplayer) mode.
+  // If forceLocal is set, treat this spawn as a local fallback and use normal local caps.
+  const effectiveMax = (serverAuthoritative && !opts.forceLocal)
+    // In multiplayer reduce visible fruits but keep at least two when base cap > 0 to avoid starvation.
+    ? Math.max((MAX_FRUITS > 0 ? 2 : 0), Math.floor(MAX_FRUITS * SERVER_SPAWN_MULTIPLIER))
+    : MAX_FRUITS;
+  if ((objects.filter(o => o.type === 'fruit').length) >= effectiveMax) return;
 
   const radius = randInt(28, 44);
   const x = rand(radius, canvas.width / DPR - radius);
   const y = canvas.height / DPR + radius + 10;
   const vx = rand(-220, 220);
-  // slightly gentler upward throw on multiplayer fallbacks to reduce clutter
+  // slightly gentler upward throw on multiplayer fallbacks, but allow occasional faster tosses for variety
   const vy = serverAuthoritative ? rand(-1200, -900) : rand(-1600, -1100);
   const color = `hsl(${randInt(10,140)},70%,55%)`;
 
@@ -3598,7 +3997,7 @@ function generateRandomShape() {
     sprite = ASSETS._fruitImages[randInt(0, ASSETS._fruitImages.length - 1)];
   }
 
-  objects.push({
+  const obj = {
     id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2),
     type: 'fruit',
     x, y, vx, vy,
@@ -3607,8 +4006,41 @@ function generateRandomShape() {
     spin: rand(-3,3),
     color,
     sprite,
-    sliced: false
-  });
+    sliced: false,
+    // animate: subtle pulse and wobble
+    spawnedAt: (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+    pulsePhase: rand(0, Math.PI * 2),
+    wobbleAmp: rand(0.6, 1.6),
+    fast: (Math.random() < 0.12) // occasional fast fruit for challenge
+  };
+
+  objects.push(obj);
+
+  // 20% chance to spawn a small companion fruit nearby if under cap (creates overlapping objects)
+  try {
+    if (Math.random() < 0.20 && (objects.filter(o => o.type === 'fruit').length) < effectiveMax) {
+      const cR = Math.max(18, Math.round(radius * rand(0.56, 0.86)));
+      const cx = Math.min(Math.max(cR, obj.x + rand(-40, 40)), canvas.width / DPR - cR);
+      const cy = obj.y + rand(6, 20);
+      objects.push({
+        id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2),
+        type: 'fruit',
+        x: cx, y: cy,
+        vx: obj.vx * rand(0.6, 1.2),
+        vy: obj.vy * rand(0.88, 1.12),
+        r: cR,
+        ang: rand(0, Math.PI*2),
+        spin: rand(-3,3),
+        color: `hsl(${randInt(10,140)},70%,55%)`,
+        sprite: sprite,
+        sliced: false,
+        spawnedAt: (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+        pulsePhase: rand(0, Math.PI * 2),
+        wobbleAmp: rand(0.6, 1.2),
+        fast: false
+      });
+    }
+  } catch (e) { /* non-fatal companion spawn failure */ }
 }
 
  function spawnBomb(opts) {
@@ -3706,104 +4138,239 @@ function drawObjects(dt) {
     }
 
     // render
-    if (o.type === 'fruit') {
-      // if a sprite image is provided and loaded, draw it scaled to the fruit radius
-      if (o.sprite && o.sprite.complete && o.sprite.naturalWidth) {
+      if (o.type === 'fruit') {
+        // subtle animated pulse/wobble for livelier visuals
+        try {
+          const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+          o.pulsePhase = (typeof o.pulsePhase === 'number') ? o.pulsePhase : (Math.random() * Math.PI * 2);
+          const elapsed = ((o.spawnedAt || now) ? (now - (o.spawnedAt || now)) : 0) * 0.001;
+          const pulse = 1 + Math.sin((now * 0.006) + (o.pulsePhase || 0)) * 0.06 * (o.wobbleAmp || 1);
+          const tilt = Math.sin((now * 0.004) + (o.pulsePhase || 0)) * 0.06 * (o.wobbleAmp || 1);
+
+          // motion blur trail for fast fruits
+          try {
+            const vx = o.vx || 0;
+            const vy = o.vy || 0;
+            const speed = Math.hypot(vx, vy);
+            if (speed > 140) {
+              const trailLen = Math.min(1.0, speed / 800);
+              ctx.save();
+              ctx.globalCompositeOperation = 'lighter';
+              const tg = ctx.createLinearGradient(o.x, o.y, o.x - vx * 0.02, o.y - vy * 0.02);
+              tg.addColorStop(0, 'rgba(255,255,255,0.12)');
+              tg.addColorStop(1, 'rgba(255,255,255,0.00)');
+              ctx.fillStyle = tg;
+              ctx.beginPath();
+              ctx.ellipse(o.x - vx * 0.02 * trailLen, o.y - vy * 0.02 * trailLen, o.r * 1.2, Math.max(4, Math.abs(vx) * 0.01 + Math.abs(vy) * 0.01), 0, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+          } catch(e){}
+
+          // if a sprite image is provided and loaded, draw it scaled to the fruit radius with pulse
+          if (o.sprite && o.sprite.complete && o.sprite.naturalWidth) {
+            ctx.save();
+            ctx.translate(o.x, o.y);
+            ctx.rotate(o.ang + tilt);
+            const size = o.r * 2 * pulse;
+            ctx.drawImage(o.sprite, -size/2, -size/2, size, size);
+            // subtle outline
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+            try { ctx.strokeRect(-size/2, -size/2, size, size); } catch(e){}
+            ctx.restore();
+          } else {
+            // polished fruit: radial shading, leaf, and soft ground shadow with pulse
+            try {
+              // shadow under fruit (scale with pulse so shadow slightly breathes)
+              ctx.beginPath();
+              ctx.fillStyle = 'rgba(0,0,0,0.18)';
+              ctx.ellipse(o.x, o.y + o.r * 0.7, o.r * 0.9 * pulse, o.r * 0.45 * pulse, 0, 0, Math.PI*2);
+              ctx.fill();
+
+              // body gradient
+              const rg = ctx.createRadialGradient(o.x - o.r*0.3, o.y - o.r*0.4, Math.max(2, o.r*0.08), o.x, o.y, o.r*1.1);
+              rg.addColorStop(0, lighten(o.color, 28));
+              rg.addColorStop(0.5, o.color);
+              rg.addColorStop(1, darken(o.color, 10));
+
+              ctx.save();
+              ctx.translate(o.x, o.y);
+              ctx.rotate(o.ang + tilt);
+              ctx.scale(pulse, pulse);
+              ctx.beginPath();
+              ctx.fillStyle = rg;
+              ctx.shadowColor = 'rgba(0,0,0,0.22)';
+              ctx.shadowBlur = 6;
+              ctx.arc(0,0,o.r,0,Math.PI*2);
+              ctx.fill();
+
+              // subtle glossy rim
+              ctx.beginPath();
+              ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+              ctx.lineWidth = Math.max(2, Math.min(4, o.r * 0.08));
+              ctx.stroke();
+
+              // small highlight crescent (transform unaffected by scale due to drawing in scaled space)
+              ctx.beginPath();
+              ctx.fillStyle = 'rgba(255,255,255,0.18)';
+              ctx.ellipse(-o.r*0.28, -o.r*0.28, o.r*0.36, o.r*0.18, Math.PI*0.25, 0, Math.PI*2);
+              ctx.fill();
+
+              // leaf
+              ctx.beginPath();
+              ctx.fillStyle = 'rgba(38,150,65,0.98)';
+              ctx.moveTo(o.r*0.4, -o.r*0.6);
+              ctx.quadraticCurveTo(o.r*0.9, -o.r*0.95, o.r*0.2, -o.r*0.2);
+              ctx.quadraticCurveTo(o.r*0.3, -o.r*0.5, o.r*0.4, -o.r*0.6);
+              ctx.fill();
+
+              // leaf vein
+              ctx.beginPath();
+              ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+              ctx.lineWidth = 1;
+              ctx.moveTo(o.r*0.58, -o.r*0.75);
+              ctx.lineTo(o.r*0.28, -o.r*0.32);
+              ctx.stroke();
+
+              ctx.restore();
+            } catch (e) {
+              // fallback to original simple circle if enhanced path fails
+              const grad = ctx.createLinearGradient(o.x - o.r, o.y - o.r, o.x + o.r, o.y + o.r);
+              grad.addColorStop(0, lighten(o.color, 20));
+              grad.addColorStop(1, darken(o.color, 5));
+              ctx.save();
+              ctx.translate(o.x, o.y);
+              ctx.rotate(o.ang);
+              ctx.beginPath();
+              ctx.fillStyle = grad;
+              ctx.shadowColor = 'rgba(0,0,0,0.35)';
+              ctx.shadowBlur = 8;
+              ctx.arc(0,0,o.r * pulse,0,Math.PI*2);
+              ctx.fill();
+              ctx.lineWidth = 3;
+              ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+        } catch (e) {
+          // degrade gracefully to prior rendering on any error
+          try {
+            const grad = ctx.createLinearGradient(o.x - o.r, o.y - o.r, o.x + o.r, o.y + o.r);
+            grad.addColorStop(0, lighten(o.color, 20));
+            grad.addColorStop(1, darken(o.color, 5));
+            ctx.save();
+            ctx.translate(o.x, o.y);
+            ctx.rotate(o.ang);
+            ctx.beginPath();
+            ctx.fillStyle = grad;
+            ctx.shadowColor = 'rgba(0,0,0,0.35)';
+            ctx.shadowBlur = 8;
+            ctx.arc(0,0,o.r,0,Math.PI*2);
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+            ctx.stroke();
+            ctx.restore();
+          } catch (innerE) {}
+        }
+    } else if (o.type === 'bomb') {
+      // improved bomb: metallic shading, animated fuse glow and small ember
+      try {
         ctx.save();
         ctx.translate(o.x, o.y);
         ctx.rotate(o.ang);
-        const size = o.r * 2;
-        ctx.drawImage(o.sprite, -o.r, -o.r, size, size);
-        // subtle outline
+
+        // metallic body
+        const mg = ctx.createLinearGradient(-o.r, -o.r, o.r, o.r);
+        mg.addColorStop(0, '#222');
+        mg.addColorStop(0.5, '#111');
+        mg.addColorStop(1, '#1a1a1a');
+        ctx.beginPath();
+        ctx.fillStyle = mg;
+        ctx.shadowColor = 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = 10;
+        ctx.arc(0,0,o.r,0,Math.PI*2);
+        ctx.fill();
+
+        // rim highlight
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+        ctx.lineWidth = Math.max(2, o.r * 0.06);
+        ctx.stroke();
+
+        // small bevel highlight
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(255,255,255,0.035)';
+        ctx.ellipse(-o.r*0.36, -o.r*0.36, o.r*0.58, o.r*0.42, 0, 0, Math.PI*2);
+        ctx.fill();
+
+        // fuse base
+        const fuseX = 0;
+        const fuseY = -o.r - 6;
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(160,160,160,0.98)';
+        ctx.rect(fuseX - 6, fuseY - 4, 12, 6);
+        ctx.fill();
+
+        // fuse line
+        ctx.beginPath();
         ctx.lineWidth = 2;
-        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-        ctx.strokeRect(-o.r, -o.r, size, size);
+        ctx.strokeStyle = 'rgba(200,160,60,0.95)';
+        ctx.moveTo(fuseX, fuseY - 1);
+        ctx.lineTo(fuseX, fuseY - 14);
+        ctx.stroke();
+
+        // animated ember: pulsating glow
+        o.fusePhase = (o.fusePhase || 0) + (0.05 + Math.abs(o.spin) * 0.004);
+        const emberY = fuseY - 14 + Math.sin(o.fusePhase) * 2.2;
+        const emberX = Math.cos(o.fusePhase * 1.6) * 2.2;
+
+        // ember glow
+        ctx.beginPath();
+        const eg = ctx.createRadialGradient(emberX, emberY, 0, emberX, emberY, 10);
+        eg.addColorStop(0, 'rgba(255,190,60,0.98)');
+        eg.addColorStop(0.4, 'rgba(255,110,30,0.8)');
+        eg.addColorStop(1, 'rgba(255,60,30,0.0)');
+        ctx.fillStyle = eg;
+        ctx.arc(emberX, emberY, 10, 0, Math.PI*2);
+        ctx.fill();
+
+        // ember core
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(255,220,120,0.98)';
+        ctx.arc(emberX, emberY, 2.4, 0, Math.PI*2);
+        ctx.fill();
+
+        // subtle danger ring (X) lightly etched
+        ctx.beginPath();
+        ctx.lineWidth = Math.max(2, o.r * 0.05);
+        ctx.strokeStyle = 'rgba(255,80,80,0.14)';
+        ctx.moveTo(-o.r*0.5, -o.r*0.5);
+        ctx.lineTo(o.r*0.5, o.r*0.5);
+        ctx.moveTo(o.r*0.5, -o.r*0.5);
+        ctx.lineTo(-o.r*0.5, o.r*0.5);
+        ctx.stroke();
+
         ctx.restore();
-      } else {
-        // fallback: simple glossy circle
-        const grad = ctx.createLinearGradient(o.x - o.r, o.y - o.r, o.x + o.r, o.y + o.r);
-        grad.addColorStop(0, lighten(o.color, 20));
-        grad.addColorStop(1, darken(o.color, 5));
+      } catch(e){
+        // fallback to original simple bomb drawing on error
         ctx.save();
         ctx.translate(o.x, o.y);
         ctx.rotate(o.ang);
         ctx.beginPath();
-        ctx.fillStyle = grad;
-        ctx.shadowColor = 'rgba(0,0,0,0.35)';
-        ctx.shadowBlur = 8;
+        ctx.fillStyle = '#111';
+        ctx.shadowColor = 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = 10;
         ctx.arc(0,0,o.r,0,Math.PI*2);
         ctx.fill();
-        // outline
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-        ctx.stroke();
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(255,180,40,0.95)';
+        ctx.arc(0, -o.r - 14, 3, 0, Math.PI*2);
+        ctx.fill();
         ctx.restore();
       }
-    } else if (o.type === 'bomb') {
-      // simple cartoon bomb with animated fuse/spark
-      ctx.save();
-      ctx.translate(o.x, o.y);
-      ctx.rotate(o.ang);
-
-      // body
-      ctx.beginPath();
-      ctx.fillStyle = '#111';
-      ctx.shadowColor = 'rgba(0,0,0,0.6)';
-      ctx.shadowBlur = 10;
-      ctx.arc(0,0,o.r,0,Math.PI*2);
-      ctx.fill();
-
-      // subtle highlight
-      ctx.beginPath();
-      ctx.fillStyle = 'rgba(255,255,255,0.04)';
-      ctx.ellipse(-o.r*0.35, -o.r*0.35, o.r*0.6, o.r*0.45, 0, 0, Math.PI*2);
-      ctx.fill();
-
-      // red glow outline
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = 'rgba(200,30,30,0.9)';
-      ctx.stroke();
-
-      // cartoon fuse base (small metal cap)
-      const fuseX = 0;
-      const fuseY = -o.r - 6;
-      ctx.beginPath();
-      ctx.fillStyle = 'rgba(120,120,120,0.95)';
-      ctx.rect(fuseX - 6, fuseY - 4, 12, 6);
-      ctx.fill();
-
-      // fuse line
-      ctx.beginPath();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = 'rgba(200,160,60,0.95)';
-      ctx.moveTo(fuseX, fuseY - 1);
-      ctx.lineTo(fuseX, fuseY - 14);
-      ctx.stroke();
-
-      // animated spark using fusePhase
-      o.fusePhase = (o.fusePhase || 0) + (0.04 + Math.abs(o.spin) * 0.002);
-      const sparkY = fuseY - 14 + Math.sin(o.fusePhase) * 2;
-      const sparkX = Math.cos(o.fusePhase * 1.5) * 2;
-      ctx.beginPath();
-      ctx.fillStyle = 'rgba(255,180,40,0.95)';
-      ctx.arc(sparkX, sparkY, 3, 0, Math.PI*2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.fillStyle = 'rgba(255,80,20,0.9)';
-      ctx.arc(sparkX, sparkY, 1.6, 0, Math.PI*2);
-      ctx.fill();
-
-      // X mark
-      ctx.beginPath();
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = 'rgba(255,80,80,0.95)';
-      ctx.moveTo(-o.r*0.6, -o.r*0.6);
-      ctx.lineTo(o.r*0.6, o.r*0.6);
-      ctx.moveTo(o.r*0.6, -o.r*0.6);
-      ctx.lineTo(-o.r*0.6, o.r*0.6);
-      ctx.stroke();
-
-      ctx.restore();
     }
   }
 }
@@ -3958,11 +4525,153 @@ function drawPopups(dt) {
     ctx.strokeText(p.text, p.x, p.y);
     ctx.fillText(p.text, p.x, p.y);
     ctx.restore();
-    ctx.globalAlpha = 1;
+  ctx.globalAlpha = 1;
   }
 }
 
-// scoring and hit handling
+/* Simple sliced-fruit halves + light tail system
+   - spawnSlices(obj, x, y) creates two simple textured halves that fly apart
+   - drawSlices(dt) updates & renders slice halves and their light motion-tails
+   - kept deliberately lightweight to avoid heavy CPU/GPU work on slower devices
+*/
+function spawnSlices(obj, hitX, hitY) {
+  try {
+    if (!obj || obj.type !== 'fruit') return;
+    // small safety cap to avoid huge slice bursts
+    if (slices.length > 48) return;
+
+    const baseColor = obj.color || '#ffcc66';
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+
+    for (let i = 0; i < 2; i++) {
+      const dir = (i === 0) ? -1 : 1;
+      const speedJitterX = rand(-120, 120);
+      const speedJitterY = rand(-40, 40);
+      const baseVx = (typeof obj.vx === 'number') ? obj.vx * 0.6 : rand(-60, 60);
+      const baseVy = (typeof obj.vy === 'number') ? obj.vy * 0.6 : rand(-600, -400);
+
+      // make slices fly apart faster and fade quicker so they disappear sooner
+      slices.push({
+        id: `${obj.id}_slice_${i}_${Math.random().toString(36).slice(2,8)}`,
+        x: hitX || obj.x || 0,
+        y: hitY || obj.y || 0,
+        vx: (baseVx + dir * Math.abs(speedJitterX)) * 1.28,
+        vy: (baseVy * 1.12) + speedJitterY,
+        ang: (obj.ang || 0) + dir * rand(0.3, 1.4),
+        spin: (obj.spin || 0) + dir * rand(3, 8),
+        w: Math.max(12, (obj.r || 30) * 1.06),
+        h: Math.max(8, (obj.r || 30) * 0.7),
+        color: baseColor,
+        // shorter life so slices vanish faster
+        life: 0.55,
+        born: now,
+        // trail points for light tail - keep trail short to reduce persistence
+        trail: [{ x: hitX || obj.x || 0, y: hitY || obj.y || 0, t: now }],
+        trailMax: 6
+      });
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
+function updateAndDrawSlices(dt) {
+  if (!ctx) return;
+  try {
+    // update physics + trail
+    for (let i = slices.length - 1; i >= 0; i--) {
+      const s = slices[i];
+      if (!s) { slices.splice(i, 1); continue; }
+      // integrate with gravity (lighter than fruit)
+      s.vy += GRAVITY * 0.28 * dt;
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.ang += s.spin * dt;
+      // speed up slice fade so sliced pieces disappear faster
+      s.life -= dt * 2.2;
+
+      // push trail sample occasionally (more frequent but keep trail very short)
+      const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      const last = s.trail[s.trail.length - 1];
+      if (!last || (now - last.t) > 12) {
+        s.trail.push({ x: s.x, y: s.y, t: now });
+        // keep trail very short (respect optional trailMax)
+        const maxTrail = (typeof s.trailMax === 'number') ? s.trailMax : 6;
+        if (s.trail.length > maxTrail) s.trail.shift();
+      }
+
+      // remove when life exhausted or moved far off-screen
+      if (s.life <= 0 || s.y - s.h > canvas.height / DPR + 180 || s.x < -240 || s.x > canvas.width / DPR + 240) {
+        slices.splice(i, 1);
+        continue;
+      }
+    }
+
+    // draw all slices (tails first for layering)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    for (const s of slices) {
+      try {
+        // tail: thin fading polyline following recent positions
+        if (s.trail && s.trail.length > 1) {
+          ctx.beginPath();
+          for (let t = 0; t < s.trail.length; t++) {
+            const p = s.trail[t];
+            if (!p) continue;
+            if (t === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+          }
+          // tail style — slightly brightened variant of fruit color
+          ctx.strokeStyle = (function(c, a) {
+            try {
+              return `rgba(255,255,255,${0.06 + Math.max(0, s.life * 0.6)})`;
+            } catch(e) { return `rgba(255,255,255,${0.06})`; }
+          })();
+          ctx.lineWidth = Math.max(1.2, Math.min(4, s.w * 0.04));
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
+
+        // draw half-like ellipses with a small cut highlight to suggest a sliced surface
+        ctx.save();
+        ctx.translate(s.x, s.y);
+        ctx.rotate(s.ang);
+        // main half-body
+        ctx.beginPath();
+        ctx.ellipse(0, 0, s.w * 0.7, s.h * 0.9, 0, 0, Math.PI * 2);
+        // soft fill using s.color
+        try {
+          const g = ctx.createLinearGradient(-s.w*0.6, -s.h*0.8, s.w*0.6, s.h*0.8);
+          g.addColorStop(0, lighten(s.color || '#ffcc66', 18));
+          g.addColorStop(0.6, s.color || '#ffcc66');
+          g.addColorStop(1, darken(s.color || '#ffcc66', 8));
+          ctx.fillStyle = g;
+        } catch(e) { ctx.fillStyle = s.color || '#ffcc66'; }
+        ctx.globalAlpha = Math.max(0.18, Math.min(1, s.life));
+        ctx.fill();
+
+        // thin inner rim to suggest exposed flesh
+        ctx.beginPath();
+        ctx.lineWidth = Math.max(1, s.w * 0.06);
+        ctx.strokeStyle = `rgba(255,255,255,${0.08 + (s.life * 0.12)})`;
+        ctx.stroke();
+
+        // small cut highlight arc
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.ellipse(-s.w*0.12, -s.h*0.18, s.w*0.22, s.h*0.14, 0.3, 0, Math.PI*2);
+        ctx.fill();
+
+        ctx.restore();
+      } catch (e) { /* draw errors non-fatal */ }
+    }
+
+    ctx.restore();
+  } catch (e) {
+    console.warn('updateAndDrawSlices failed', e);
+  }
+}
+
+ // scoring and hit handling
 function handleHit(obj, hitPoint) {
   // Deduplicate rapid hits / in-flight interactions
   if (obj.sliced || obj._tentativeRemove || obj._pendingInteraction) return;
@@ -4150,12 +4859,14 @@ function handleHit(obj, hitPoint) {
     spawnParticles(fx, fy, 'rgba(255,80,80,0.95)', 18);
     spawnPopup(fx, fy, '-20', { col: 'rgba(255,80,80,0.95)', size: 20 });
     flashNotice('-20 (bomb)');
-    playSound('bomb');
+    try { playSound('bomb'); } catch(e){}
   } else {
     score += 10;
+    // spawn lightweight slice halves + trails for a simple sliced animation
+    try { spawnSlices(obj, fx, fy); } catch(e){}
     spawnParticles(fx, fy, 'rgba(255,255,255,0.95)', 12);
     spawnPopup(fx, fy, '+10', { col: 'rgba(255,240,200,1)', size: 18 });
-    playSound('slice');
+    try { playSound('slice'); } catch(e){}
   }
 
   setTimeout(()=> {
@@ -5367,15 +6078,18 @@ function onResults(results) {
     }
     if (now - lastBombSpawn > bombInterval) {
       lastBombSpawn = now;
-      if (Math.random() < 0.6) spawnBomb();
+      // increase local chance to spawn bombs to make ninja-fruit more challenging
+      if (Math.random() < 0.8) spawnBomb();
       console.log('Spawned bomb locally:', objects.length);
     }
   }
-  // update objects physics & draw for all ninja-fruit modes
-  drawObjects(dt);
-  if (objects.length > 0) {
-    console.log(`Rendering ${objects.length} objects in ninja-fruit mode`);
-  }
+    // update objects physics & draw for all ninja-fruit modes
+    drawObjects(dt);
+    // lightweight sliced-halves + trails update/draw (simple tail visuals for sliced fruits)
+    try { updateAndDrawSlices(dt); } catch(e){}
+    if (objects.length > 0) {
+      console.log(`Rendering ${objects.length} objects in ninja-fruite mode`);
+    }
   } else {
     // Non-fruit modes should not show ninja objects; clear any leftover objects.
     if (objects.length) objects.length = 0;
